@@ -28,8 +28,8 @@ import sys
 import mrcfile
 
 
-def process_one_folder(folder: Path, output_folder: Path):
-    stack_name = folder.name + ".mrc"
+def process_one_folder(folder: Path, output_folder: Path, mrc_suffix):
+    stack_name = folder.name + mrc_suffix
     tlt_name = folder.name + ".tlt"
     stack_path, tlt_path = folder / stack_name, folder / tlt_name
     if stack_path is None:
@@ -80,30 +80,29 @@ def main():
     ap.add_argument("-i", "--input", required=True, help="input folder containing multi IMOD-processed folders")
     ap.add_argument("--recursive", action="store_true", help="process folders recursively (default: False), i.e. the "
                                                              "input folder includes IMOD-processed folders")
-    ap.add_argument("-o", "--output", default="./frames", help="output folder (default: ./frames)")
-    ap.add_argument("--log", default="./processed_ts.log", help="log file containing processed folders (default: "
-                                                                "./processed_ts.log)")
+    ap.add_argument("-o", "--output", required=True, help="output folder for .mrc images")
+    ap.add_argument("--mrc-suffix", default=".mrc", help="mrc suffix (default .mrc)")
+    ap.add_argument("--log", help="log file containing processed folders (default: <output>/processed_ts.log)")
     ap.add_argument("--workers", type=int, default=4, help="parallel workers (default: 4)")
 
     args = ap.parse_args()
 
     input_folder = Path(args.input)
-    log_file = Path(args.log)
+    output_folder = Path(args.output)
+    log_file = Path(args.log) if args.log else output_folder / "processed_ts.log"
     if not input_folder.exists() or not input_folder.is_dir():
         print(f"Input {input_folder} not found or not a directory", file=sys.stderr)
         sys.exit(2)
-    if not log_file.exists() or not log_file.is_file():
-        print(f"Log {log_file} not found or not a file", file=sys.stderr)
-        sys.exit(2)
 
-    output_folder = Path(args.output)
     output_folder.mkdir(parents=True, exist_ok=True)
-
     processed = set()
-    with open(args.log, "r") as f:
-        for line in f:
-            if line.strip() and line.strip().startswith(input_folder.name):
-                processed.add(line.strip().split('/')[-1])
+    if not log_file.exists():
+        log_file.touch()
+    else:
+        with open(log_file, "r") as f:
+            for line in f:
+                if line.strip() and line.strip().startswith(input_folder.name):
+                    processed.add(line.strip().split('/')[-1])
 
     if args.recursive:
         # p is PATH, will never be equal with string
@@ -118,7 +117,7 @@ def main():
     ok, fail = 0, 0
     print("------START------")
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_one_folder, folder, output_folder): folder for folder in folders}
+        futures = {executor.submit(process_one_folder, folder, output_folder, args.mrc_suffix): folder for folder in folders}
         for fut in as_completed(futures):
             folder = futures[fut]
             try:
@@ -130,7 +129,7 @@ def main():
                 if res:
                     print(f"[OK] {folder}")
                     ok += 1
-                    with open(args.log, "a") as logf:
+                    with open(log_file, "a") as logf:
                         logf.write(str(folder) + "\n")
                 else:
                     print(f"[FAILED] {folder}")

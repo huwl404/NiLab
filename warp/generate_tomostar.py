@@ -208,7 +208,7 @@ def main():
                                                              "<folder>_<angle>.mrc files)")
     ap.add_argument("--recursive", action="store_true", help="process folders recursively (default: False), i.e. the "
                                                              "input folder includes IMOD-processed folders")
-    ap.add_argument("-o", "--output", default="./tomostar", help="output directory for .star files (default ./tomostar)")
+    ap.add_argument("-o", "--output", required=True, help="output directory for .tomostar files.")
     ap.add_argument("--workers", type=int, default=4, help="parallel workers (default 4)")
     ap.add_argument("--csv-suffix", default="_test.csv", help="csv suffix (default _test.csv)")
     ap.add_argument("--total-row", type=int, default=35, help="expected total rows (default 35)")
