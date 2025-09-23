@@ -202,7 +202,7 @@ def process_one_folder(folder: Path, frame_dir: Path, output_dir: Path, args):
 
 def main():
     ap = argparse.ArgumentParser(description="Generate .tomostar files for Warp from IMOD-processed tilt series using "
-                                             "order CSV, .tlt, and frame averages. ")
+                                             "order CSV and frame averages. ")
     ap.add_argument("-i", "--input", required=True, help="tilt-series root folder if --recursive or single folder")
     ap.add_argument("-f", "--frame-dir", required=True, help="frame-series-average root folder (contains "
                                                              "<folder>_<angle>.mrc files)")
