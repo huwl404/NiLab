@@ -176,6 +176,8 @@ def process_one_folder(folder: Path, frame_dir: Path, output_dir: Path, args):
         })
 
     out_star = output_dir / (folder_name + ".tomostar")
+    # sort on angle
+    star_rows.sort(key=lambda r: r["wrpAngleTilt"])
     with out_star.open("w", newline="") as fh:
         fh.write("data_\n\nloop_\n")
         fh.write(f"_wrpMovieName #1\n")
