@@ -7,10 +7,17 @@
 # Author     ：Jago
 # Email      ：huwl@hku.hk
 # Description：
-Delete specified optics-groups from matching_tomograms.star and matching.star.
-- Saves a _full backup first
-- Removes rows/blocks corresponding to the specified OGs
-- Renumbers remaining OGs from 1
+Delete specified optics-groups from matching_tomograms.star and matching.star, saving full backups (*_full.star) before modification.
+For matching_tomograms.star
+ - Remove rows in data_global and corresponding tomogram blocks matching given OGs.
+ - Renumber remaining _rlnOpticsGroupName digit parts to 1..N in order of appearance.
+For matching.star
+ - Remove rows in data_optics and data_particles for given OGs.
+ - Renumber remaining _rlnOpticsGroup and update _rlnOpticsGroupName digit parts to 1..N.
+For both files, renumbering preserves order of first appearance.
+A compact 3-line mapping table (old IDs, divider, new IDs) is printed.
+Example:
+    python delete_ogs.py -t matching_tomograms.star -m matching.star --og 3 5
 """
 from pathlib import Path
 import argparse

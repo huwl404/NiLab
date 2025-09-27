@@ -5,22 +5,32 @@
 # File       : split_matchingstar.py
 # Time       ：2025/9/26 23:08
 # Author     ：Jago
-# Email      ：huwl@hku.hk
-# Description：
-Split matching_tomograms.star and matching.star into two optimisation sets by optics-group range.
-  1. In matching_tomograms.star, ensure data_global's _rlnTomoImportFractionalDose equals user-specified value:
-     if not, update it to that value (stored as float with 3 decimals) and print which rows were changed.
-  2. Split matching_tomograms.star:
-     - split rows of data_global in original order into two halves (first ceil(N/2), rest)
-     - each half keeps only per-tomogram data blocks that correspond to the tomogram names kept
-     - extract digits from _rlnOpticsGroupName for tomograms in each half, compute min/max -> OG range
-     - save the two tomograms files with suffix _OG{start}-{end}.star
-  3. Split matching.star:
-     - keep data_general in both outputs
-     - data_optics: keep only rows that match optics groups used by that half (by _rlnOpticsGroupName)
-     - data_particles: keep only rows whose _rlnOpticsGroup matches the filtered optics groups
-     - save two particle files with same OG suffix: _OG{start}-{end}.star
-  4. Write two matching_optimisation_set_OG{start}-{end}.star files containing:
+# Email      ：huwl@hku.hk #
+Description：
+Split matching_tomograms.star and matching.star into two optimisation sets by optics-group range, fixing per-tilt dose
+if requested and renumbering optics groups to 1-based in outputs.
+  1. For each input matching_tomograms.star the script:
+  - optionally fix `_rlnTomoImportFractionalDose` in the `data_global` block to the user-specified dose (written with 3 decimals).
+    If any rows are changed the original full tomograms star is saved as `<basename>_original.star` and the modified full file overwrites the original filename.
+  2. Split the `data_global` rows (preserving original order) into two halves (first ceil(N/2), rest).
+  - for each half it keeps only the per-tomogram data blocks that correspond to the tomogram names in that half,
+  - computes the optics-group number range from `_rlnOpticsGroupName`,
+  - renumbers those optics-group names so their digit parts start from 1,
+  - writes two tomograms files named: <matching_tomograms>_OG<start>-<end>.star,
+  - prints the mapping old->new (three-line table) for each produced tomograms file.
+  3. Read the input matching.star and split it into two particle files that correspond to the optics groups in each tomograms half:
+  - Keep `data_general` in both outputs
+  - `data_optics` & `data_particles` block : keep only rows whose original `_rlnOpticsGroup` belong to that half,
+  - Renumber optics-group IDs and the digit part of `_rlnOpticsGroupName` to start at 1 in each split,
+  - Write two particle star files named: <matching>_OG<start>-<end>.star,
+  - prints the mapping old->new (three-line table) for each produced particle file.
+  4. For each pair of outputs (tomograms + particles) write a  optimisation-set file:
+  - matching_optimisation_set_OG<start>-<end>.star which contains two entries: _rlnTomoParticlesFile &_rlnTomoTomogramsFile.
+Examples:
+  Fix dose in matching_tomograms.star, split and generate optimisation sets:
+      python split_matchingstar.py -t matching_tomograms.star -m matching.star -d 3.0
+  Split without changing dose:
+      python split_matchingstar.py -t matching_tomograms.star -m matching.star
 """
 from pathlib import Path
 import argparse
@@ -217,12 +227,24 @@ def fix_dose_split_tomograms(in_path: Path, dose) -> Tuple[Path, Path, Dict[int,
         else:
             print(f"[SKIP] Tomograms star file containing rlnTomoName {k} not in global block.")
 
-    og1_start, og1_end = get_og_range(dict1["global"])
-    og2_start, og2_end = get_og_range(dict2["global"])
+    s1, e1 = get_og_range(dict1["global"])
+    s2, e2 = get_og_range(dict2["global"])
 
     base = in_path.stem
-    out1_path = Path(f"{base}_OG{og1_start}-{og1_end}.star")
-    out2_path = Path(f"{base}_OG{og2_start}-{og2_end}.star")
+    # out1_path = Path(f"{base}_OG{og1_start}-{og1_end}.star")
+    # out2_path = Path(f"{base}_OG{og2_start}-{og2_end}.star")
+    # if input filename already contains _OG<start>-<end>, offset the new OG numbers
+    m = re.search(r"_OG(\d+)-(\d+)$", base)
+    if m:
+        orig_start = int(m.group(1))
+        prefix = base[:m.start()]
+        s1, e1 = orig_start + s1 - 1, orig_start + e1 - 1
+        s2, e2 = orig_start + s2 - 1, orig_start + e2 - 1
+    else:
+        prefix = base
+
+    out1_path = Path(f"{prefix}_OG{s1}-{e1}.star")
+    out2_path = Path(f"{prefix}_OG{s2}-{e2}.star")
 
     # renumber optics names in each global block so digit parts start at 1
     dict1_global_new, map1 = renumber_global_names(dict1["global"])
@@ -281,8 +303,19 @@ def split_particles_generate_sets(in_path: Path, tomograms_out1: Path, tomograms
     s1, e1 = min(set1), max(set1)
     s2, e2 = min(set2), max(set2)
     base = in_path.stem
-    out1_path = Path(f"{base}_OG{s1}-{e1}.star")
-    out2_path = Path(f"{base}_OG{s2}-{e2}.star")
+    # out1_path = Path(f"{base}_OG{s1}-{e1}.star")
+    # out2_path = Path(f"{base}_OG{s2}-{e2}.star")
+    m = re.search(r"_OG(\d+)-(\d+)$", base)
+    if m:
+        orig_start = int(m.group(1))
+        prefix = base[:m.start()]
+        s1, e1 = orig_start + s1 - 1, orig_start + e1 - 1
+        s2, e2 = orig_start + s2 - 1, orig_start + e2 - 1
+    else:
+        prefix = base
+
+    out1_path = Path(f"{prefix}_OG{s1}-{e1}.star")
+    out2_path = Path(f"{prefix}_OG{s2}-{e2}.star")
 
     # dict1 = {"general": df_general.copy(), "optics": df_optics1, "particles": df_particles1}
     # dict2 = {"general": df_general.copy(), "optics": df_optics2, "particles": df_particles2}
