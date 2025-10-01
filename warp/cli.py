@@ -6,38 +6,15 @@
 # Time       ：2025/10/1 12:58
 # Author     ：Jago
 # Email      ：huwl@hku.hk
-# Description： Main difference compared with https://github.com/warpem/warp-tm-vis/blob/main/src/warp_tm_vis/cli.py
+# Description：replace the original cli.py with this script and just run
+Main difference compared with https://github.com/warpem/warp-tm-vis/blob/main/src/warp_tm_vis/cli.py
 changed line "import rich" to "from rich.console import Console"
 changed line "console = rich.console.Concole()" to "console = Console()"
 
-changed line "matching_pattern: str = typer.Option" to "matching_pattern: Optional[str] = typer.Option"
-changed line "correlation_volume_pattern: str = typer.Option" to "correlation_volume_pattern: Optional[str] = typer.Option"
-added
-"
-    load_correlation_volumes: bool = typer.Option(
-        default=True,
-        help="whether or not to load correlation volumes (overridden to False if no correlation pattern)"
-    ),
-"
-changed line "correlation_volume_files = list(matching_directory.glob(correlation_volume_pattern))" to
-"
-correlation_volume_files: List[Path] = []
-    if correlation_volume_pattern:
-        correlation_volume_files = list(matching_directory.glob(correlation_volume_pattern))
-        console.log(f"found {len(correlation_volume_files)} correlation volume files")
-    else:
-        if load_correlation_volumes:
-            console.log("No correlation-volume pattern provided -> only display particle positions.")
-            load_correlation_volumes = False
-"
-changed line "viewer.window.add_dock_widget(subset_particles, area='bottom')" to
-"
-    if load_correlation_volumes:
-        viewer.window.add_dock_widget(subset_particles, area='bottom')
-"
-
 changed a lot of add_tomogram function
 added get_absolute_particle_positions function
+
+added --load_correlation_volumes and --bin parameters, customized many parameters for SMV dataset
 """
 from enum import Enum
 from pathlib import Path
