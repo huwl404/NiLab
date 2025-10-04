@@ -7,8 +7,8 @@
 # Author     ：Jago
 # Email      ：huwl@hku.hk
 # Description：
-Split a protein chain into segments (domains or arbitrary ranges) and arrange each segment as a separate chain along the x-axis for visualization purposes.
-The relative coordinates within each segment are preserved, but the segments are translated (not rotated).
+Split a protein chain into segments and arrange each segment as a separate chain along the x-axis.
+The relative coordinates within each segment are preserved, the segments are rotated and translated.
 Chemical validity is not maintained.
 """
 import argparse
