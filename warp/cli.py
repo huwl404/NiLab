@@ -6,15 +6,8 @@
 # Time       ：2025/10/1 12:58
 # Author     ：Jago
 # Email      ：huwl@hku.hk
-# Description：replace the original cli.py with this script and just run
-Main difference compared with https://github.com/warpem/warp-tm-vis/blob/main/src/warp_tm_vis/cli.py
-changed line "import rich" to "from rich.console import Console"
-changed line "console = rich.console.Concole()" to "console = Console()"
-
-changed a lot of add_tomogram function
-added get_absolute_particle_positions function
-
-added --load_correlation_volumes and --bin parameters, customized many parameters for SMV dataset
+# Description：adapted from https://github.com/warpem/warp-tm-vis/blob/main/src/warp_tm_vis/cli.py
+newer version can be found at https://github.com/huwl404/tm-vis/
 """
 from enum import Enum
 from pathlib import Path

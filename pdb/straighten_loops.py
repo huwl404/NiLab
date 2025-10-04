@@ -7,6 +7,7 @@
 # Author     ：Jago
 # Email      ：huwl@hku.hk
 # Description：
+deprecated
 把指定链上按 domain ranges 的相邻 domain 之间的 loop 拉直（线性插值），并输出新 PDB。
 此脚本会破坏化学合理性，仅作可视化。
 """
@@ -22,7 +23,7 @@ def parse_domains(domstr):
     domains = []
     for p in parts:
         if "-" not in p:
-            raise ValueError(f"[Skipped] Wrong domain {p}")
+            print(f"[Skipped] Wrong domain {p}")
         s, e = p.split("-", 1)
         domains.append((int(s), int(e)))
     return domains

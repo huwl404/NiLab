@@ -95,7 +95,7 @@ def process_star(in_star: Path, output_dir: Path, bin_factor: int, shift_pixels:
         rotation=np.eye(3)
     )
 
-    binned_coords = new_coords / float(bin_factor)
+    binned_coords = new_coords / bin_factor
 
     # gather per-tomogram groups
     tomo_names = df['rlnTomoName'].to_numpy()
@@ -128,7 +128,7 @@ def main():
                                              "applying recenter and local shift, then bin coordinates.")
     ap.add_argument("-i", "--input", required=True, help="input STAR file (must contain particles and optics)")
     ap.add_argument("-o", "--output", required=True, help="output directory for per-tomo star files")
-    ap.add_argument("-b", "--bin", type=int, default=1, help="bin factor to apply to coordinates (default 1)")
+    ap.add_argument("-b", "--bin", type=float, default=1.0, help="bin factor to apply to coordinates (default 1)")
     ap.add_argument("--shift", nargs=3, type=float, default=(0.0, 0.0, 0.0),
                     help="local shift in pixels (X Y Z, default=0.0, 0.0, 0.0), will be applied in coordinates")
     args = ap.parse_args()
