@@ -20,7 +20,6 @@ from Bio.PDB.Atom import Atom
 from Bio.PDB.Chain import Chain
 from Bio.PDB.Model import Model
 from Bio.PDB.Structure import Structure
-from collections import OrderedDict
 import string
 
 

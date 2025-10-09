@@ -56,13 +56,12 @@ def compute_tilt_median_intensities(path: Path, sample_factor: int = 10) -> floa
             finite_vals = flat[finite_mask]
             n = finite_vals.size
 
-            # 计算最大可用长度（整除 sample_factor）
             usable_len = (n // sample_factor) * sample_factor
             if usable_len == 0:
                 # not enough pixels to sample at given factor
                 sample_vals = finite_vals
             else:
-                # 等间隔选择：0, sample_factor, 2*sample_factor, ...
+                # choose every interval：0, sample_factor, 2*sample_factor, ...
                 idxs = np.arange(0, usable_len, sample_factor)
                 sample_vals = finite_vals[idxs]
 
@@ -166,6 +165,7 @@ def process_one_folder(folder: Path, frame_dir: Path, output_dir: Path, args):
         axis_angle = args.axis_angle
         masked_fraction = args.masked_fraction
 
+        # can not override tilt angle as opposite numbers here, would cause issue with .xf and .tlt!
         star_rows.append({
             "wrpMovieName": wrpMovieName,
             "wrpAngleTilt": angle,
@@ -178,6 +178,8 @@ def process_one_folder(folder: Path, frame_dir: Path, output_dir: Path, args):
     out_star = output_dir / (folder_name + ".tomostar")
     # sort on angle
     star_rows.sort(key=lambda r: r["wrpAngleTilt"])
+    # flip writing sequence while dont change angles
+    # star_rows.sort(key=lambda r: -r["wrpAngleTilt"] if args.flipZ else r["wrpAngleTilt"])
     with out_star.open("w", newline="") as fh:
         fh.write("data_\n\nloop_\n")
         fh.write(f"_wrpMovieName #1\n")
@@ -188,13 +190,14 @@ def process_one_folder(folder: Path, frame_dir: Path, output_dir: Path, args):
         fh.write(f"_wrpMaskedFraction #6\n")
 
         for r in star_rows:
-            # format numbers
+            # override here
+            # ang_val = - r['wrpAngleTilt'] if args.flipZ else r['wrpAngleTilt']
+            movie = r['wrpMovieName'].rjust(name_len)
             ang_s = f"{r['wrpAngleTilt']:{dec_len}.{fmt_dec}f}"
             axis_s = f"{r['wrpAxisAngle']:{dec_len}.{fmt_dec}f}"
             dose_s = f"{r['wrpDose']:{dec_len}.{fmt_dec}f}"
             avg_s = f"{r['wrpAverageIntensity']:{dec_len}.{fmt_dec}f}"
             mask_s = f"{r['wrpMaskedFraction']:{dec_len}.{fmt_dec}f}"
-            movie = r['wrpMovieName'].ljust(name_len)
             fh.write(f"{movie}{ang_s}{axis_s}{dose_s}{avg_s}{mask_s}\n")
 
     return True
@@ -206,9 +209,9 @@ def main():
     ap.add_argument("-i", "--input", required=True, help="tilt-series root folder if --recursive or single folder")
     ap.add_argument("-f", "--frame-dir", required=True, help="frame-series-average root folder (contains "
                                                              "<folder>_<angle>.mrc files)")
+    ap.add_argument("-o", "--output", required=True, help="output directory for .tomostar files.")
     ap.add_argument("--recursive", action="store_true", help="process folders recursively (default: False), i.e. the "
                                                              "input folder includes IMOD-processed folders")
-    ap.add_argument("-o", "--output", required=True, help="output directory for .tomostar files.")
     ap.add_argument("--workers", type=int, default=4, help="parallel workers (default 4)")
     ap.add_argument("--csv-suffix", default="_test.csv", help="csv suffix (default _test.csv)")
     ap.add_argument("--total-row", type=int, default=35, help="expected total rows (default 35)")
