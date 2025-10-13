@@ -423,7 +423,7 @@ MCore \
 --perdevice_refine 2
 ```
 
-#### Finally we achieve ZIKV: 7. Å with higher resolution and more density restored!
+#### Finally we achieve ZIKV: 7.35 Å with higher resolution and more density restored!
 ![relion-warp-reconstruction-compare.png](img%2Frelion-warp-reconstruction-compare.png)
 
 # Reference
