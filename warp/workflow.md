@@ -1,6 +1,10 @@
+newest protocol can be found here:
+
+https://hku.notion.site/Using-Warp-M-after-Relion4-28c8022e7dd680c08928c4966a405bd0
+
 # Prerequisite
 
-After the routine workflow in Dr. Ni’s lab, now you have aligned tilt series from IMOD (containing ***.xf***and ***.tlt*** files), order list from emClarity (***.csv*** files), particles from other software (***.star*** file, no matter what binning factor you are using).
+After the routine workflow in Dr. Ni’s lab, now you have aligned tilt series from IMOD (containing ***.xf*** and ***.tlt*** files), order list from emClarity (***.csv*** files), particles from other software (***.star*** file, no matter what binning factor you are using).
 
 # Project Hierarchy
 
