@@ -138,6 +138,8 @@ def process_one_folder(folder: Path, frame_dir: Path, output_dir: Path, args):
         print(f"[SKIP] {folder}: No rows in {csv_path} file.")
         return False
 
+    # The angles' sequence in the order list is not the real order because user might delete some
+    # This would generate wrong dose. To handle this issue, expected angle_seq is created.
     angle_seq = build_angle_sequence(args.total_row, args.increase, args.flip_after, args.direction)
     dose_seq = [t * args.exposure for t in range(0, args.total_row)]
 
