@@ -7,10 +7,10 @@
 # Author     ：Jago
 # Email      ：huwl@hku.hk
 # Description：
-Show and inspect particle annotations by overlaying YOLO-style label boxes on corresponding MRC images.
-For each matching <name>.mrc and <name>.txt pair, the script:
-  1. Reads the MRC image and parses the label file containing class x_center y_center width height.
-  2. Converts normalized YOLO coordinates into pixel positions based on the MRC image width and height.
+Show and inspect particle annotations by overlaying YOLO-style label boxes on corresponding images.
+For each matching <name>.mrc/<name>.tif and <name>.txt pair, the script:
+  1. Reads the image and parses the label file containing class x_center y_center width height.
+  2. Converts normalized YOLO coordinates into pixel positions based on the image width and height.
   3. Displays the image with red bounding boxes and yellow center markers for each labeled particle.
   4. Allows interactive navigation:
     n / → — next image
@@ -18,11 +18,14 @@ For each matching <name>.mrc and <name>.txt pair, the script:
     s — save current overlay as PNG in <out>/ (default overlays/)
     q / Esc — quit viewer
 Examples:
-View overlays for a single dataset:
+View overlays for a single dataset containing .tif images:
     python show_labels.py -m ./output/map -l ./output/label
 """
 import argparse
+import os
 import sys
+
+import cv2
 import mrcfile
 import numpy as np
 import matplotlib.pyplot as plt
@@ -78,9 +81,17 @@ class Viewer:
     def show_current(self):
         self.ax.clear()
         mrc_path, txt_path = self.pairs[self.index]
-        m = mrcfile.open(mrc_path, permissive=True)  # shape = (y, x)
-        img = np.asarray(m.data).astype(int)  # int16
-        m.close()
+        map_ext = os.path.splitext(mrc_path)[-1]
+        if map_ext in [".mrc", ".map"]:
+            m = mrcfile.open(mrc_path, permissive=True)  # shape = (y, x)
+            img = np.asarray(m.data).astype(np.int16)  # int16
+            m.close()
+        elif map_ext in [".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp"]:
+            # unless you assign integer unchanged, otherwise it would transform int16 to int8.
+            img = cv2.imread(mrc_path, cv2.IMREAD_UNCHANGED)
+        else:
+            raise ValueError(f"Unsupported file type: {map_ext}")
+
         h, w = img.shape[0], img.shape[1]
         self.ax.set_title(f"{mrc_path.name}")
         self.im = self.ax.imshow(img, cmap="gray", origin="upper")
@@ -125,12 +136,16 @@ class Viewer:
     def next(self):
         if self.index < len(self.pairs) - 1:
             self.index += 1
-            self.show_current()
+        else:
+            self.index = 0
+        self.show_current()
 
     def prev(self):
         if self.index > 0:
             self.index -= 1
-            self.show_current()
+        else:
+            self.index = len(self.pairs) - 1
+        self.show_current()
 
     def save_overlay(self):
         mrc_path, txt_path = self.pairs[self.index]
@@ -146,9 +161,9 @@ class Viewer:
 
 def main():
     ap = argparse.ArgumentParser(description="Show particles from label txt on corresponding mrc images.")
-    ap.add_argument("--maps", "-m", required=True, help="folder with .mrc files")
+    ap.add_argument("--maps", "-m", required=True, help="folder with image files")
     ap.add_argument("--labels", "-l", required=True, help="folder with label .txt files (same basename)")
-    ap.add_argument("--map-ext", default=".mrc", help="extension for map files (default: .mrc)")
+    ap.add_argument("--map-ext", default=".png", help="extension for map files (default: .png)")
     ap.add_argument("--txt-ext", default=".txt", help="extension for label files (default: .txt)")
     ap.add_argument("--start", type=int, default=0, help="start index (0-based)")
     ap.add_argument("--out", default="overlays", help="folder to save overlay PNGs (default: overlays/)")

@@ -7,11 +7,12 @@
 # Author     ：Jago
 # Email      ：huwl@hku.hk
 # Description：:
-Generate per-tile MRC maps and YOLO-style label files from a SerialEM .nav file referencing montage maps.
+Generate per-tile maps and YOLO-style label files from a SerialEM .nav file referencing montage maps.
 For each .nav file, the script:
   1. Reads map and point items using utils.reader.read_nav_file().
-  2. Locates referenced montage MRC files.
-  3. Splits each montage into single-slice tiles according to MapFramesXY, writing them under <out>/map/ as <mapstem>_tileNNN.mrc.
+  2. Locates referenced montage MRC files and estimates global gray minimum and maximum.
+  3. Splits each montage into single-slice tiles (brightness is rescaled based on whole montage) according to MapFramesXY,
+  writing them under <out>/map/ as <mapstem>_tileNNN.png (int8).
   4. Collects point coordinates (XYinPc) for each tile, skips the first point per DrawnID,
   and converts pixel positions to normalized YOLO coordinates using --boxsize.
   5. Writes per-tile label files under <out>/label/ with format: class x_center y_center width height (class fixed to 0).
@@ -23,9 +24,13 @@ Re-run and overwrite existing files:
 """
 import argparse
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+import cv2
 import mrcfile
 from pathlib import Path
 from typing import Tuple, List, Dict
+import numpy as np
 
 from utils import reader
 
@@ -65,7 +70,70 @@ def build_maps_dict(nav_path: Path, map_items) -> Dict[int, Dict]:
     return maps
 
 
-def process_nav(nav_path: Path, out_dir: Path, boxsize: int, overwrite: bool = False):
+def estimate_global_percentiles(mrc, per_tile_sample=2000, p_low=1, p_high=99):
+    """Use global gray percentile to clip the range of each tile, avoiding too dark or too bright"""
+    z_len = mrc.data.shape[0]
+    samples = []
+    for i in range(z_len):
+        arr = mrc.data[i]
+        flat = arr.ravel()
+        step = max(1, flat.size // per_tile_sample)
+        samples.append(flat[::step])
+    samples = np.concatenate(samples)
+    lo, hi = np.percentile(samples, (p_low, p_high))
+    return float(lo), float(hi)
+
+
+def save_tile(mapid: int, mpath: Path, lo, hi, out_dir, map_ext, lbl_ext, overwrite):
+    """Use ProcessPool and cv2 to speed up writing tiles."""
+    map_out = out_dir / "map"
+    label_out = out_dir / "label"
+    mrc = mrcfile.mmap(mpath, mode='r+')
+    x_len, y_len, z_len = mrc.data.shape[2], mrc.data.shape[1], mrc.data.shape[0]
+    tile_info = {}
+    written = 0
+    for piece in range(z_len):
+        tile_name = f"{mpath.stem}_tile{piece:03d}"
+        # tile_path = map_out / (tile_name + ".mrc")
+        # Ultralytics only support images with format
+        # {'tif', 'png', 'mpo', 'pfm', 'jpeg', 'heic', 'tiff', 'bmp', 'jpg', 'dng', 'webp'}
+        tile_path = map_out / (tile_name + map_ext)
+        txt_path = label_out / (tile_name + lbl_ext)
+        tile_info[piece] = {
+            "tile_path": tile_path,
+            "txt_path": txt_path,
+            "x_len": x_len,
+            "y_len": y_len
+        }
+        if tile_path.exists() and not overwrite:
+            print(f"[INFO] Tile exists: {tile_path}. Skipped.")
+            continue
+
+        # try:
+        #     # tile = mrcfile.new_mmap(tile_path, shape=(y_len, x_len), mrc_mode=1, overwrite=True)  # int16
+        #     # tile.data[:, :] = mrc.data[piece, :, :]
+        #     img = mrc.data[piece]
+        #     img_norm = ((img - img.min()) / (img.max() - img.min()) * 255).astype(np.uint8)
+        #     Image.fromarray(img_norm).save(tile_path)
+        #     summary["tiles_written"] += 1
+        # except Exception as e:
+        #     print(f"[ERROR] Saving tile {tile_path}: {e}", file=sys.stderr)
+
+        # Nearly all regular picture software would open pictures in int8 unless you explicitly assign int16!!!
+        img = mrc.data[piece].astype(np.uint16)
+        # To avoid transforming to float64 to compute img_norm
+        img = img.astype(np.float16)
+        # Ultralytics only accept int8 images to be trained and reasoned
+        # img_norm = ((img - img.min()) / (img.max() - img.min()) * 255).astype(np.uint8)
+        imgf = np.clip(img, lo, hi)
+        img_norm = ((imgf - lo) / (hi - lo) * 255.0).round().astype(np.uint8)
+        cv2.imwrite(str(tile_path), img_norm)
+        written += 1
+    mrc.close()
+    return mapid, tile_info, written
+
+
+def process_nav(nav_path: Path, out_dir: Path, boxsize: int, map_ext: str, lbl_ext: str, overwrite: bool = False):
     print(f"[INFO] Reading nav: {nav_path}")
     items = reader.read_nav_file(str(nav_path))
     map_items, point_items = find_map_and_point_items(items)
@@ -85,6 +153,7 @@ def process_nav(nav_path: Path, out_dir: Path, boxsize: int, overwrite: bool = F
 
     # split montage into tiles
     tile_info_by_map: Dict[int, Dict[int, Dict]] = {}
+    tasks = []
     for map_id, md in maps.items():
         mpath = md["MapPath"]
         nx, ny = md["MapFramesXY"]
@@ -92,35 +161,22 @@ def process_nav(nav_path: Path, out_dir: Path, boxsize: int, overwrite: bool = F
         # Open the file in memory-mapped mode
         mrc = mrcfile.mmap(mpath, mode='r+')
         # in imod, mrc.data is in x, y, z (col, row, sec); but in mrcfile, mrc.data is in z, y, x!!!
-        if mrc.data.shape[0] != total_tiles:
+        z_len = mrc.data.shape[0]
+        gl_lo, gl_hi = estimate_global_percentiles(mrc)
+        mrc.close()
+        if z_len != total_tiles:
             print(f"[Error] Montage tiles do not match with MapFramesXY. Skipped.")
             continue
 
-        x_len, y_len = mrc.data.shape[2], mrc.data.shape[1]
-        tile_info = {}
-        for piece in range(total_tiles):
-            tile_name = f"{mpath.stem}_tile{piece:03d}"
-            tile_path = map_out / (tile_name + ".mrc")
-            txt_path = label_out / (tile_name + ".txt")
-            tile_info[piece] = {
-                "tile_path": tile_path,
-                "txt_path": txt_path,
-                "x_len": x_len,
-                "y_len": y_len
-            }
-            if tile_path.exists() and not overwrite:
-                print(f"[INFO] Tile exists: {tile_path}. Skipped.")
-                continue
+        tasks.append((map_id, mpath, gl_lo, gl_hi))
 
-            try:
-                tile = mrcfile.new_mmap(tile_path, shape=(y_len, x_len), mrc_mode=1, overwrite=True)  # int16
-                tile.data[:, :] = mrc.data[piece, :, :]
-                summary["tiles_written"] += 1
-            except Exception as e:
-                print(f"[ERROR] Saving tile {tile_path}: {e}", file=sys.stderr)
-        mrc.close()
-        tile_info_by_map[map_id] = tile_info
-        summary["maps_processed"] += 1
+    with ProcessPoolExecutor() as executor:
+        futures = [executor.submit(save_tile, t[0], t[1], t[2], t[3], out_dir, map_ext, lbl_ext, overwrite) for t in tasks]
+        for f in as_completed(futures):
+            mid, tile_info, w = f.result()
+            tile_info_by_map[mid] = tile_info
+            summary["tiles_written"] += w
+            summary["maps_processed"] += 1
 
     # allocate points lists per tile (class, x_center, y_center, width, height)
     points_per_tile: Dict[Path, List[Tuple[int, float, float, float, float]]] = {}
@@ -181,6 +237,8 @@ def main():
     ap.add_argument("-i", "--nav", required=True, help="input .nav file (maps should be in the same folder with .nav)")
     ap.add_argument("-o", "--out", required=True, help="output folder, folder map/ and label/ would be created under this")
     ap.add_argument("-b", "--boxsize", type=int, default=150, help="target box size in pixels on the maps")
+    ap.add_argument("--map-ext", default=".png", help="extension for map files (default: .png)")
+    ap.add_argument("--lbl-ext", default=".txt", help="extension for label files (default: .txt)")
     ap.add_argument("--override", action="store_true", help="override existing files")
     args = ap.parse_args()
 
@@ -189,7 +247,7 @@ def main():
         print(f"[ERROR] nav file not found: {nav_path}", file=sys.stderr)
         sys.exit(2)
     out_dir = Path(args.out)
-    rc = process_nav(nav_path, out_dir, args.boxsize, args.override)
+    rc = process_nav(nav_path, out_dir, args.boxsize, args.map_ext, args.lbl_ext, args.override)
     sys.exit(rc)
 
 
