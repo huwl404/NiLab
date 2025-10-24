@@ -41,7 +41,7 @@ def backup_file(src: Path, suffix: str, overwrite: bool = False) -> Path:
     """Copy src -> src + suffix (same directory). Return backup path."""
     backup = src.with_name(src.name + suffix)
     if backup.exists() and not overwrite:
-        print(f"[INFO] Backup exists, skip: {backup}")
+        print(f"[INFO] Backup exists, skip writing {backup}")
         return backup
     shutil.copy2(src, backup)
     return backup

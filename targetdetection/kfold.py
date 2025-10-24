@@ -19,7 +19,7 @@ import shutil
 from tqdm import tqdm
 
 
-ksplit = 3
+ksplit = 4
 img_ext = "*.png"
 lbl_ext = "*.txt"
 # replace with 'path/to/dataset' for your custom data

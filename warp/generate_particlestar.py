@@ -51,7 +51,7 @@ def shift_then_rotate_particles(
     return updated_particle_positions, updated_orientations
 
 
-def process_star(in_star: Path, output_dir: Path, bin_factor: int, shift_pixels: Tuple[float, float, float]):
+def process_star(in_star: Path, output_dir: Path, tomostar_dir: Path, bin_factor: int, shift_pixels: Tuple[float, float, float]):
     """
     Main worker: read star, recenter & shift, bin coordinates and write per-tomo star files.
     """
@@ -88,6 +88,7 @@ def process_star(in_star: Path, output_dir: Path, bin_factor: int, shift_pixels:
     # build rotation matrices: as before, use ZYZ euler, invert to get particle->global mapping
     rot_mats = R.from_euler(angles=eulers, seq='ZYZ', degrees=True).inv().as_matrix()  # (n,3,3)
     shift_pixels = np.asarray(shift_pixels, dtype=float)
+    # dont operate on orientations
     new_coords, _ = shift_then_rotate_particles(
         particle_positions=coords_corrected,
         particle_orientations=rot_mats,
@@ -101,7 +102,18 @@ def process_star(in_star: Path, output_dir: Path, bin_factor: int, shift_pixels:
     tomo_names = df['rlnTomoName'].to_numpy()
     unique_tomos = np.unique(tomo_names)
 
-    for tomo in unique_tomos:
+    # gather all .tomostar filenames
+    tomostar_names = {p.stem for p in tomostar_dir.iterdir() if p.is_file()}
+    # if tomostar_names is provided, filter to only those tomos
+    kept_tomos = []
+    if tomostar_names is not None:
+        for t in unique_tomos:
+            if t in tomostar_names:
+                kept_tomos.append(t)
+            else:
+                print(f"[INFO] Skipped writing {t}.star because this tomogram was not imported in {tomostar_dir}.")
+
+    for tomo in kept_tomos:
         mask = (tomo_names == tomo)
         tomo_coords = binned_coords[mask]  # (m,3)
         tomo_eulers = eulers[mask]         # (m,3)
@@ -120,14 +132,16 @@ def process_star(in_star: Path, output_dir: Path, bin_factor: int, shift_pixels:
             for (x, y, z), (rot, tilt, psi) in zip(tomo_coords, tomo_eulers):
                 fh.write(f" {x:.8f} {y:.8f} {z:.8f} {rot:.6f} {tilt:.6f} {psi:.6f} {tomo}.tomostar\n")
 
-    return len(unique_tomos)
+    return len(kept_tomos)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Split particles from a multi-tomogram STAR into per-tomo STARs after "
                                              "applying recenter and local shift, then bin coordinates.")
     ap.add_argument("-i", "--input", required=True, help="input STAR file (must contain particles and optics)")
-    ap.add_argument("-o", "--output", required=True, help="output directory for per-tomo star files")
+    ap.add_argument("-o", "--output", required=True, help="output directory for per-tomo .star files")
+    ap.add_argument("-t", "--tomostar", default=None, help="directory containing .tomostar files. If assigned, "
+                                                           "only keep particles corresponding to these tomograms")
     ap.add_argument("-b", "--bin", type=float, default=1.0, help="bin factor to apply to coordinates (default 1)")
     ap.add_argument("--shift", nargs=3, type=float, default=(0.0, 0.0, 0.0),
                     help="local shift in pixels (X Y Z, default=0.0, 0.0, 0.0), will be applied in coordinates")
@@ -139,12 +153,19 @@ def main():
         print(f"Input {in_star} not found or not a file.", file=sys.stderr)
         sys.exit(2)
 
+    tomostar_dir = None
+    if args.tomostar is not None:
+        tomostar_dir = Path(args.tomostar)
+        if not tomostar_dir.exists() or not tomostar_dir.is_dir():
+            print(f"Reference {tomostar_dir} not found or not a directory.", file=sys.stderr)
+            sys.exit(2)
+
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("------START------")
-    n_tomos = process_star(in_star, out_dir, args.bin, tuple(args.shift))
+    n_tomos = process_star(in_star, out_dir, tomostar_dir, args.bin, tuple(args.shift))
 
-    print(f"Written {n_tomos} per-tomo STAR files to {out_dir}/")
+    print(f"Written {n_tomos} per-tomo STAR files to {out_dir}.")
 
 
 if __name__ == "__main__":

@@ -271,7 +271,7 @@ def main():
                 fail += 1
             else:
                 if res:
-                    print(f"[OK] {folder}")
+                    # print(f"[OK] {folder}")
                     ok += 1
                 else:
                     print(f"[FAILED] {folder}")
