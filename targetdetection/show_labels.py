@@ -161,7 +161,7 @@ class Viewer:
 
 def main():
     ap = argparse.ArgumentParser(description="Show particles from label txt on corresponding mrc images.")
-    ap.add_argument("--maps", "-m", required=True, help="folder with image files")
+    ap.add_argument("--images", "-m", required=True, help="folder with image files")
     ap.add_argument("--labels", "-l", required=True, help="folder with label .txt files (same basename)")
     ap.add_argument("--map-ext", default=".png", help="extension for map files (default: .png)")
     ap.add_argument("--txt-ext", default=".txt", help="extension for label files (default: .txt)")
@@ -169,7 +169,7 @@ def main():
     ap.add_argument("--out", default="overlays", help="folder to save overlay PNGs (default: overlays/)")
     args = ap.parse_args()
 
-    map_dir = Path(args.maps)
+    map_dir = Path(args.images)
     label_dir = Path(args.labels)
     if not map_dir.exists() or not map_dir.is_dir():
         print("maps folder not found", file=sys.stderr)

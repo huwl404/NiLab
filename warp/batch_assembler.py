@@ -83,7 +83,7 @@ def main():
     missing = ensure_all_exist(parent, prefixes, base_fd, base_fp, base_out)
     if missing:
         missing_str = "\n".join(missing)
-        print(f"[ERROR] Following files or directories not found: {missing_str}")
+        print(f"[ERROR] Following files or directories not found: \n{missing_str}")
         sys.exit(2)
 
     # copy first warp_frameseries.settings to warp_frameseries, then replace Param DataFolder and ProcessingFolder

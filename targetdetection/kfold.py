@@ -19,16 +19,18 @@ import shutil
 from tqdm import tqdm
 
 
-ksplit = 4
+ksplit = 2
 img_ext = "*.png"
 lbl_ext = "*.txt"
 # replace with 'path/to/dataset' for your custom data
-dataset_path = Path("/home/lab_NiT/huwl/TargetDetection/cleaned_data")
-all_images = sorted((dataset_path / "map").rglob(img_ext))
-labels = sorted((dataset_path / "label").rglob(lbl_ext))
-
+# dataset_path = Path("/home/lab_NiT/huwl/TargetDetection/cleaned_data")
+dataset_path = Path("./test")
+all_images = sorted((dataset_path / "images").rglob(img_ext))
+labels = sorted((dataset_path / "labels").rglob(lbl_ext))
 # your data YAML with data directories and names dictionary
-yaml_file = "/home/lab_NiT/huwl/TargetDetection/0_1020.yaml"
+# yaml_file = "/home/lab_NiT/huwl/TargetDetection/0_1020.yaml"
+yaml_file = "./dataset.yaml"
+
 with open(yaml_file, encoding="utf8") as y:
     classes = yaml.safe_load(y)["names"]
 cls_idx = sorted(classes.keys())

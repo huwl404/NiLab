@@ -54,17 +54,17 @@ def move_pair(map_src: Path, label_src: Path, map_dst_dir: Path, label_dst_dir: 
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Move random matching map/label pairs to an output folder.")
-    ap.add_argument("--maps", "-m", required=True, help="folder with image files")
+    ap = argparse.ArgumentParser(description="Move random matching image/label pairs to an output folder.")
+    ap.add_argument("--images", "-i", required=True, help="folder with image files")
     ap.add_argument("--labels", "-l", required=True, help="folder with label .txt files (same basename)")
     ap.add_argument("--map-ext", default=".png", help="extension for map files (default: .png)")
     ap.add_argument("--txt-ext", default=".txt", help="extension for label files (default: .txt)")
-    ap.add_argument("-o", "--out", default="selected", help="output folder (will contain map/ and label/)")
+    ap.add_argument("-o", "--out", default="selected", help="output folder (will contain images/ and labels/)")
     ap.add_argument("-c", "--count", type=int, default=16, help="number of pairs to move (default: 16)")
     ap.add_argument("--override", action="store_true", help="overwrite files in destination if exist")
     args = ap.parse_args()
 
-    map_dir = Path(args.maps)
+    map_dir = Path(args.images)
     label_dir = Path(args.labels)
     if not map_dir.exists() or not map_dir.is_dir():
         print(f"[ERROR] maps folder not found: {map_dir}", file=sys.stderr)
@@ -88,8 +88,8 @@ def main():
     print(f"[INFO] Will move {len(chosen)} pair(s) to {args.out}.")
 
     out_dir = Path(args.out)
-    map_out = out_dir / "map"
-    label_out = out_dir / "label"
+    map_out = out_dir / "images"
+    label_out = out_dir / "labels"
     out_dir.mkdir(parents=True, exist_ok=True)
     map_out.mkdir(parents=True, exist_ok=True)
     label_out.mkdir(parents=True, exist_ok=True)

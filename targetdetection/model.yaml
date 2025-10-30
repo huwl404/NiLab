@@ -1,0 +1,26 @@
+nc: 1 # 1 class
+backbone:
+    # [from, repeats, module, args]
+    - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2, after this, (1, 3, 4096, 4096) -> (1, 64, 2048, 2048)
+    # Conv + BatchNorm + SiLU [out_ch, kernel, stride, pad, groups]
+    # (conv): Conv2d(3, 64, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+    # (bn): BatchNorm2d(64, eps=0.001, momentum=0.03, affine=True, track_running_stats=True)
+    # (act): SiLU(inplace=True)
+
+    - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4, after this, (1, 64, 2048, 2048) -> (1, 128, 1024, 1024)
+
+    # - [-1, 3, C2f, [128, True]] # 2
+    # C2f [out_ch, shortcut, expansion]
+    - [-1, 2, C3k2, [128, True]] # 2
+
+    - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8, after this, (1, 128, 1024, 1024) -> (1, 256, 512, 512)
+
+    # - [-1, 6, C2f, [256, True]] # 4
+    - [-1, 4, C3k2, [256, True]] # 4
+
+    - [-1, 1, SPPF, [256, 5]] # 5 [out_ch, kernel_size]
+
+head:
+    - [-1, 1, Conv, [256, 3, 1]] # 6
+    - [[6], 1, Detect, [nc]] # 7 [nc, anchors, ch]
+#    - [-1, 1, nn.Identity, []] # Pass-through for debugging

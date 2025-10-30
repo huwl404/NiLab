@@ -1,0 +1,9 @@
+# path: /home/lab_NiT/huwl/TargetDetection/cleaned_data # dataset root dir
+path: ./test/
+
+# Assign this to train on gray images.
+channels: 1
+
+# Classes
+names:
+  0: DMV
