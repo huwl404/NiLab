@@ -118,6 +118,7 @@ class Viewer:
             self.scatter = self.ax.scatter(xs, ys, s=10, c="yellow", marker="x")
         self.ax.set_xlim(0, w)
         self.ax.set_ylim(h, 0)
+        # self.ax.set_ylim(0, h)
         self.fig.canvas.draw_idle()
 
     def on_key(self, event):
