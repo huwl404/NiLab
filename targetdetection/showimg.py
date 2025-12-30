@@ -34,8 +34,8 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 
 
-def find_pairs(map_dir: Path, label_dir: Optional[Path], map_ext: str = ".mrc", label_ext: str = ".txt"):
-    maps = sorted(map_dir.glob(f"*{map_ext}"))
+def find_pairs(map_dir: Path, label_dir: Optional[Path], img_ext: str = ".png", label_ext: str = ".txt"):
+    maps = sorted(map_dir.glob(f"*{img_ext}"))
     pairs = []
     for m in maps:
         if label_dir is None:
@@ -189,7 +189,7 @@ def main():
         print("labels folder not found", file=sys.stderr)
         sys.exit(2)
 
-    pairs = find_pairs(map_dir, label_dir, map_ext=args.map_ext, label_ext=args.txt_ext)
+    pairs = find_pairs(map_dir, label_dir, img_ext=args.img_ext, label_ext=args.txt_ext)
     if not pairs:
         print("No images found.", file=sys.stderr)
         sys.exit(1)
