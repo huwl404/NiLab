@@ -1,0 +1,25 @@
+nc: 1 # 1 class
+backbone:
+    # [from, repeats, module, args]
+    - [-1, 1, Conv, [64, 3, 2]] # 0, P1, 2X downsample, after this, (1, 3, 4096, 4096) -> (1, 64, 2048, 2048)
+    - [-1, 1, Conv, [128, 3, 2]] # 1, P2, 4X downsample, after this, (1, 64, 2048, 2048) -> (1, 128, 1024, 1024)
+    - [-1, 3, C2f, [128, True]] # 2 P2 features: 128 X 1024 X 1024, Double Membrane precision!
+    - [-1, 1, Conv, [256, 3, 2]] # 3, P3, 8X downsample, after this, (1, 128, 1024, 1024) -> (1, 256, 512, 512)
+    - [-1, 6, C2f, [256, True]] # 4 P3 features: 256 X 512 X 512
+    - [-1, 1, Conv, [512, 3, 2]] # 5, P4, 16X downsample, after this, (1, 256, 512, 512) -> (1, 512, 256, 256)
+    - [-1, 6, C2f, [512, True]] # 6 P4 features: 512 X 256 X 256
+    - [-1, 1, SPPF, [512, 5]] # 7 [out_ch, kernel_size] This module is equivalent to SPP(k=(5, 9, 13)).
+head:
+    - [-1, 1, nn.Upsample, [None, 2, nearest]] # 8 -> 512 X 512 X 512
+    - [[-1, 4], 1, Concat, [1]] # 9 512 X 512 X 512 + 256 X 512 X 512
+    - [-1, 3, C2f, [512] ] # 10 -> 512 X 512 X 512
+
+    - [-1, 1, nn.Upsample, [None, 2, nearest]] # 11 -> 512 X 1024 X 1024
+    - [[-1, 2], 1, Concat, [1]] # 12 512 X 1024 X 1024 + 128 X 1024 X 1024
+    - [-1, 3, C2f, [256] ] # 13
+
+    - [[7, 10, 13], 1, Detect, [nc]] # 14 [nc, anchors, ch]
+# model4 summary: 153 layers, 33,721,363 parameters, 33,721,347 gradients, 495.4 GFLOPs
+# md4pm5 2048: Best results observed at epoch 260, best model saved as best.pt. 0.494      0.558
+# md4pm1 4096: Best results observed at epoch 49, best model saved as best.pt. 0.626       0.26
+# md4pm4 SAHI+small box: Best results observed at epoch 13, best model saved as best.pt. 0.399       0.45

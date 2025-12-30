@@ -24,8 +24,8 @@ from ultralytics import YOLO
 #     dataset_yaml = split_dir / split / f"{split}_dataset.yaml"
 #     ds_yamls.append(dataset_yaml)
 
-md = "./model2.yaml"
-ds = "./test/2025-10-29_2-Fold_Cross-val/split_1/split_1_dataset.yaml"
+md = "./classify_model2.yaml"
+# ds = "./test/2025-10-29_2-Fold_Cross-val/split_1/split_1_dataset.yaml"
 
 # results = {}
 batch = 16
@@ -52,8 +52,8 @@ model = YOLO(md, verbose=True, task="detect")
 model.info()
 
 # Inspect individual layers
-for i, layer in enumerate(model.model.model):
-    print(f"Layer {i}: {layer}")
+# for i, layer in enumerate(model.model.model):
+#     print(f"Layer {i}: {layer}")
 
 # output = model.model(torch.randn(1, 3, 4096, 4096))
 # print(f"Output shape: {output.shape}")  # Should match expected dimensions

@@ -1,26 +1,26 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
 
-"""
-# File       : predict.py
-# Time       : 2025/11/8 12:43
-# Author     : Jago
-# Email      : huwl@hku.hk
-# Description：
-"""
 from ultralytics import YOLO
 
 # Load a pretrained YOLO11n model
-model = YOLO("./data/md2_pm2_best.pt")
+model = YOLO("./data/11n_1K_classifier_best.pt")
 
-# Define path to the image file
-source = "./test/images/mmm001_tile000.png"
+# Define a glob search for all JPG files in a directory
+source = "./test/*.png"
 
 # Run inference on the source
 results = model(source,
-                save_txt=True,
-                save_conf=True,
-                save_crop=True,
+                stream=True,
+                imgsz=1024,
                 device="cpu",
-                project="whereisproect",
-                name="whereisname")  # list of Results objects
+                project="whereisproject",
+                name="whereisname")
+
+for r in results:
+    if r is not None:
+        print(r)
+        p = r.probs
+        cls = r.names[p.top1]
+        conf = round(p.top1conf.item(), 2)
+        print(f"{cls}: {conf}")

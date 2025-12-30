@@ -2,7 +2,7 @@
 # -*- coding:utf-8 -*-
 
 """
-# File       : show_labels.py
+# File       : showimg.py
 # Time       ：2025/10/20 19:16
 # Author     ：Jago
 # Email      ：huwl@hku.hk
@@ -19,7 +19,7 @@ For each matching <name>.mrc/<name>.tif and <name>.txt pair, the script:
     q / Esc — quit viewer
 Examples:
 View overlays for a single dataset containing .tif images:
-    python show_labels.py -m ./output/map -l ./output/label
+    python showimg.py -m ./output/map -l ./output/label
 """
 import argparse
 import os
@@ -31,17 +31,24 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 
-def find_pairs(map_dir: Path, label_dir: Path, map_ext: str = ".mrc", label_ext: str = ".txt"):
+def find_pairs(map_dir: Path, label_dir: Optional[Path], map_ext: str = ".mrc", label_ext: str = ".txt"):
     maps = sorted(map_dir.glob(f"*{map_ext}"))
     pairs = []
     for m in maps:
+        if label_dir is None:
+            # 如果没有标签目录，直接添加图片，标签位设为 None
+            pairs.append((m, None))
+            continue
         name = m.stem
         lab = label_dir / (name + label_ext)
         if lab.exists():
             pairs.append((m, lab))
+        else:
+            # 如果提供了目录但找不到对应文件，也可以选择只显示图片
+            pairs.append((m, None))
     return pairs
 
 
@@ -51,9 +58,7 @@ def read_labels(txt_path: Path) -> List[Tuple[int, float, float, float, float]]:
     with txt_path.open("r", encoding="utf-8") as fh:
         for line in fh:
             s = line.strip()
-            if not s:
-                continue
-            if s.startswith("#"):
+            if not s or s.startswith("#"):
                 continue
             parts = s.split()
             if len(parts) < 5:
@@ -68,10 +73,11 @@ def read_labels(txt_path: Path) -> List[Tuple[int, float, float, float, float]]:
 
 
 class Viewer:
-    def __init__(self, pairs, overlays_out: Path):
+    def __init__(self, pairs, overlays_out: Path, bin_factor: int = 1):
         self.pairs = pairs
         self.index = 0
         self.overlays_out = overlays_out
+        self.bin_factor = max(1, bin_factor)
         self.fig, self.ax = plt.subplots()
         self.im = None
         self.rects = []  # 存当前图片的补丁
@@ -81,7 +87,7 @@ class Viewer:
     def show_current(self):
         self.ax.clear()
         mrc_path, txt_path = self.pairs[self.index]
-        map_ext = os.path.splitext(mrc_path)[-1]
+        map_ext = os.path.splitext(mrc_path)[-1].lower()
         if map_ext in [".mrc", ".map"]:
             m = mrcfile.open(mrc_path, permissive=True)  # shape = (y, x)
             img = np.asarray(m.data).astype(np.int16)  # int16
@@ -92,30 +98,33 @@ class Viewer:
         else:
             raise ValueError(f"Unsupported file type: {map_ext}")
 
-        h, w = img.shape[0], img.shape[1]
-        self.ax.set_title(f"{mrc_path.name}")
+        if self.bin_factor > 1:
+            img = img[::self.bin_factor, ::self.bin_factor]
+        h, w = img.shape[:2]
+        self.ax.set_title(f"{mrc_path.name} (bin{self.bin_factor})")
         self.im = self.ax.imshow(img, cmap="gray", origin="upper")
-        labels = read_labels(txt_path)
-        print(f"{mrc_path} has {len(labels)} points.")
-        self.rects = []
-        xs = []
-        ys = []
-        # draw rectangles
-        for (cls, x_c, y_c, bw, bh) in labels:
-            xc = x_c * w
-            yc = y_c * h
-            bw_px = bw * w
-            bh_px = bh * h
-            x0 = xc - bw_px / 2.0
-            y0 = yc - bh_px / 2.0
-            rect = patches.Rectangle((x0, y0), bw_px, bh_px, linewidth=1.0, edgecolor="red", facecolor="none")
-            self.ax.add_patch(rect)
-            self.rects.append(rect)
-            xs.append(xc)
-            ys.append(yc)
-        # draw center points
-        if xs and ys:
-            self.scatter = self.ax.scatter(xs, ys, s=10, c="yellow", marker="x")
+        if txt_path is not None:
+            labels = read_labels(txt_path)
+            print(f"{mrc_path} has {len(labels)} points.")
+            self.rects = []
+            xs = []
+            ys = []
+            # draw rectangles
+            for (cls, x_c, y_c, bw, bh) in labels:
+                xc = x_c * w
+                yc = y_c * h
+                bw_px = bw * w
+                bh_px = bh * h
+                x0 = xc - bw_px / 2.0
+                y0 = yc - bh_px / 2.0
+                rect = patches.Rectangle((x0, y0), bw_px, bh_px, linewidth=1.0, edgecolor="red", facecolor="none")
+                self.ax.add_patch(rect)
+                self.rects.append(rect)
+                xs.append(xc)
+                ys.append(yc)
+            # draw center points
+            if xs and ys:
+                self.scatter = self.ax.scatter(xs, ys, s=10, c="yellow", marker="x")
         self.ax.set_xlim(0, w)
         self.ax.set_ylim(h, 0)
         # self.ax.set_ylim(0, h)
@@ -163,30 +172,31 @@ class Viewer:
 def main():
     ap = argparse.ArgumentParser(description="Show particles from label txt on corresponding mrc images.")
     ap.add_argument("--images", "-m", required=True, help="folder with image files")
-    ap.add_argument("--labels", "-l", required=True, help="folder with label .txt files (same basename)")
-    ap.add_argument("--map-ext", default=".png", help="extension for map files (default: .png)")
+    ap.add_argument("--labels", "-l", required=False, default=None, help="folder with label .txt files (same basename)")
+    ap.add_argument("--bin", type=int, default=4, help="binning factor for display (default: 4)")
+    ap.add_argument("--img-ext", default=".png", help="extension for image files (default: .png)")
     ap.add_argument("--txt-ext", default=".txt", help="extension for label files (default: .txt)")
-    ap.add_argument("--start", type=int, default=0, help="start index (0-based)")
+    ap.add_argument("--start", type=int, default=0, help="start index (0-based, default: 0)")
     ap.add_argument("--out", default="overlays", help="folder to save overlay PNGs (default: overlays/)")
     args = ap.parse_args()
 
     map_dir = Path(args.images)
-    label_dir = Path(args.labels)
+    label_dir = Path(args.labels) if args.labels else None
     if not map_dir.exists() or not map_dir.is_dir():
         print("maps folder not found", file=sys.stderr)
         sys.exit(2)
-    if not label_dir.exists() or not label_dir.is_dir():
+    if label_dir and not label_dir.exists():
         print("labels folder not found", file=sys.stderr)
         sys.exit(2)
 
     pairs = find_pairs(map_dir, label_dir, map_ext=args.map_ext, label_ext=args.txt_ext)
     if not pairs:
-        print("No matching .mrc/.txt pairs found.", file=sys.stderr)
+        print("No images found.", file=sys.stderr)
         sys.exit(1)
 
-    pairs = pairs[args.start:] + pairs[:args.start]  # rotate start
-    overlays_out = Path(args.out)
-    viewer = Viewer(pairs, overlays_out)
+    start_idx = args.start % len(pairs)
+    pairs = pairs[start_idx:] + pairs[:start_idx]
+    viewer = Viewer(pairs, Path(args.out), bin_factor=args.bin)
     viewer.show_current()
     plt.show()
 
