@@ -73,16 +73,20 @@ def read_labels(txt_path: Path) -> List[Tuple[int, float, float, float, float]]:
 
 
 class Viewer:
-    def __init__(self, pairs, overlays_out: Path, bin_factor: int = 1):
+    def __init__(self, pairs, overlays_out: Path, bin_factor: int = 1, start_index: int = 0, index_offset: int = 0):
         self.pairs = pairs
-        self.index = 0
+        self.index = start_index
         self.overlays_out = overlays_out
         self.bin_factor = max(1, bin_factor)
         self.fig, self.ax = plt.subplots()
-        self.im = None
-        self.rects = []  # 存当前图片的补丁
-        self.scatter = None
         self._cid = self.fig.canvas.mpl_connect("key_press_event", self.on_key)
+        self.global_offsets = {}
+        current_total = index_offset
+        for _, txt_path in self.pairs:
+            if txt_path and txt_path.exists():
+                self.global_offsets[txt_path] = current_total
+                # 读取该文件标签数量
+                current_total += len(read_labels(txt_path))
 
     def show_current(self):
         self.ax.clear()
@@ -90,27 +94,30 @@ class Viewer:
         map_ext = os.path.splitext(mrc_path)[-1].lower()
         if map_ext in [".mrc", ".map"]:
             m = mrcfile.open(mrc_path, permissive=True)  # shape = (y, x)
-            img = np.asarray(m.data).astype(np.int16)  # int16
+            img = np.asarray(m.data).astype(np.float32)
             m.close()
         elif map_ext in [".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp"]:
             # unless you assign integer unchanged, otherwise it would transform int16 to int8.
-            img = cv2.imread(mrc_path, cv2.IMREAD_UNCHANGED)
+            img = cv2.imread(str(mrc_path), cv2.IMREAD_UNCHANGED)
         else:
             raise ValueError(f"Unsupported file type: {map_ext}")
 
         if self.bin_factor > 1:
             img = img[::self.bin_factor, ::self.bin_factor]
+
+        c_mean = np.mean(img)
+        alpha = 128.0 / c_mean if c_mean > 0 else 1.0
+        img = cv2.convertScaleAbs(img, alpha=alpha, beta=0)
+
         h, w = img.shape[:2]
         self.ax.set_title(f"{mrc_path.name} (bin{self.bin_factor})")
-        self.im = self.ax.imshow(img, cmap="gray", origin="upper")
+        self.ax.imshow(img, cmap="gray", origin="upper")
         if txt_path is not None:
             labels = read_labels(txt_path)
-            print(f"{mrc_path} has {len(labels)} points.")
-            self.rects = []
-            xs = []
-            ys = []
+            file_offset = self.global_offsets.get(txt_path, 0)  # 获取当前文件的全局偏移
+            xs, ys = [], []
             # draw rectangles
-            for (cls, x_c, y_c, bw, bh) in labels:
+            for i, (cls, x_c, y_c, bw, bh) in enumerate(labels):
                 xc = x_c * w
                 yc = y_c * h
                 bw_px = bw * w
@@ -119,12 +126,18 @@ class Viewer:
                 y0 = yc - bh_px / 2.0
                 rect = patches.Rectangle((x0, y0), bw_px, bh_px, linewidth=1.0, edgecolor="red", facecolor="none")
                 self.ax.add_patch(rect)
-                self.rects.append(rect)
+
+                local_idx = i + 1
+                global_idx = file_offset + i + 1
+                # 在方框右上角 (x0 + bw_px, y0) 显示
+                self.ax.text(x0 + bw_px, y0, f"local: {local_idx}, global: {global_idx}", color="#7DF9FF", fontsize=7,
+                             fontweight='bold', verticalalignment='bottom', horizontalalignment='left')
                 xs.append(xc)
                 ys.append(yc)
+
             # draw center points
             if xs and ys:
-                self.scatter = self.ax.scatter(xs, ys, s=10, c="yellow", marker="x")
+                self.ax.scatter(xs, ys, s=7, c="yellow", marker="x")
         self.ax.set_xlim(0, w)
         self.ax.set_ylim(h, 0)
         # self.ax.set_ylim(0, h)
@@ -171,12 +184,13 @@ class Viewer:
 
 def main():
     ap = argparse.ArgumentParser(description="Show particles from label txt on corresponding mrc images.")
-    ap.add_argument("--images", "-m", required=True, help="folder with image files")
+    ap.add_argument("--images", "-i", required=True, help="folder with image files")
     ap.add_argument("--labels", "-l", required=False, default=None, help="folder with label .txt files (same basename)")
     ap.add_argument("--bin", type=int, default=4, help="binning factor for display (default: 4)")
     ap.add_argument("--img-ext", default=".png", help="extension for image files (default: .png)")
     ap.add_argument("--txt-ext", default=".txt", help="extension for label files (default: .txt)")
-    ap.add_argument("--start", type=int, default=0, help="start index (0-based, default: 0)")
+    ap.add_argument("--img-idx", type=int, default=0, help="image index start to display (0-based, default: 0)")
+    ap.add_argument("--lbl-idx-offset", type=int, default=0, help="offset adding to labels global index  (default: 0)")
     ap.add_argument("--out", default="overlays", help="folder to save overlay PNGs (default: overlays/)")
     args = ap.parse_args()
 
@@ -194,9 +208,8 @@ def main():
         print("No images found.", file=sys.stderr)
         sys.exit(1)
 
-    start_idx = args.start % len(pairs)
-    pairs = pairs[start_idx:] + pairs[:start_idx]
-    viewer = Viewer(pairs, Path(args.out), bin_factor=args.bin)
+    start_idx = args.img_idx % len(pairs)
+    viewer = Viewer(pairs, Path(args.out), bin_factor=args.bin, start_index=start_idx, index_offset=args.lbl_idx_offset)
     viewer.show_current()
     plt.show()
 
