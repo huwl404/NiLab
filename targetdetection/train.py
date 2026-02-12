@@ -45,15 +45,15 @@ name = f"int8_b{batch}_e{epochs}_sz{imgsz}_model0"
 #     )  # include any additional train arguments
 
 # task="detect" to handle NotImplementedError: 'YOLO' model does not support '_new' mode for 'None' task.
-model = YOLO(md, verbose=True, task="detect")
+model = YOLO("yolo11n.pt", verbose=True, task="detect")
 # model = YOLO(md)
 
 # Check model FLOPs. Failed forward pass causes 0 FLOPs.
 model.info()
 
 # Inspect individual layers
-# for i, layer in enumerate(model.model.model):
-#     print(f"Layer {i}: {layer}")
+for i, layer in enumerate(model.model.model):
+    print(f"Layer {i}: {layer}")
 
 # output = model.model(torch.randn(1, 3, 4096, 4096))
 # print(f"Output shape: {output.shape}")  # Should match expected dimensions

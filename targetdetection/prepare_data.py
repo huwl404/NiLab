@@ -199,7 +199,24 @@ def process_nav(nav_path: Path, out_dir: Path, boxsize: int, map_ext: str, lbl_e
             continue
 
         pieceon = getattr(n, "PieceOn", None)
-        xpic, ypic = getattr(n, "XYinPc", None)
+        xyinpc = getattr(n, "XYinPc", None)
+
+        # 检查 XYinPc 是否存在且有效
+        if xyinpc is None:
+            print(f"[WARNING] Point has no XYinPc attribute. Skipped.")
+            continue
+
+        # 检查 XYinPc 是否是可迭代的（如元组、列表）
+        try:
+            xpic, ypic = xyinpc
+        except (TypeError, ValueError) as e:
+            print(f"[WARNING] XYinPc is not a valid coordinate pair: {xyinpc}. Error: {e}. Skipped.")
+            continue
+
+        # 确保 pieceon 存在
+        if pieceon not in tile_info_by_map[drawnid]:
+            print(f"[WARNING] PieceOn {pieceon} not found in tile_info for DrawnID {drawnid}. Skipped.")
+            continue
 
         tile_info = tile_info_by_map[drawnid][pieceon]
         txt_path = tile_info["txt_path"]

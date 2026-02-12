@@ -45,22 +45,24 @@ def run_filter(args):
         return
     print(f"[INFO] Found {len(matched_rows)} matches. Starting to move files...")
 
-    count = 0
+    for item in tqdm(matched_rows, desc="Processing", unit="file"):
+        src_path = Path(item['filepath'])
+        if src_path.exists():
+            dst_path = output_dir / src_path.name
+            try:
+                # 移动文件 (如果目标已存在会覆盖)
+                shutil.move(str(src_path), str(dst_path))
+            except Exception as e:
+                print(f"[ERROR] Failed to move {src_path.name}: {e}")
+        else:
+            print(f"[WARNING] File not found: {src_path}")
+
     with open(output_txt, mode='w', encoding='utf-8') as txt_f:
-        for item in tqdm(matched_rows, desc="Processing", unit="file"):
-            src_path = Path(item['filepath'])
-            if src_path.exists():
-                dst_path = output_dir / src_path.name
-                try:
-                    # 移动文件 (如果目标已存在会覆盖)
-                    shutil.move(str(src_path), str(dst_path))
-                    # 写入文件名（无后缀）到 TXT
-                    txt_f.write(src_path.stem + "\n")
-                    count += 1
-                except Exception as e:
-                    print(f"[ERROR] Failed to move {src_path.name}: {e}")
-            else:
-                print(f"[WARNING] File not found: {src_path}")
+        for dst_path in sorted(output_dir.glob('*')):
+            if dst_path.name == txt_f.name:
+                continue
+            # 写入文件名（无后缀）到 TXT
+            txt_f.write(dst_path.stem + "\n")
 
     print(f"[INFO] Success! List saved in: {output_txt.absolute()}")
 

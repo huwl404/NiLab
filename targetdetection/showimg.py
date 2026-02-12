@@ -20,6 +20,18 @@ For each matching <name>.mrc/<name>.tif and <name>.txt pair, the script:
 Examples:
 View overlays for a single dataset containing .tif images:
     python showimg.py -m ./output/map -l ./output/label
+
+interesting bug:
+Matplotlib 是一个跨平台的绘图库，但它本身并不负责“画图”这个动作，而是把绘图指令交给底层的图形界面框架（如 Tkinter, Qt, GTK, WX 等）。
+交互式后端（Interactive backends）： 比如 TkAgg, Qt5Agg。
+非交互式后端（Non-interactive backends）： 比如 Agg, PDF, SVG。
+在没有手动指定时，Matplotlib 通常会根据系统环境自动猜测使用哪个后端。
+在许多 Linux 服务器上，Matplotlib 默认可能会选择 Qt5Agg 或 GTK3Agg。这些后端非常“重”，它们依赖复杂的共享库和复杂的 X11 协议扩展。当通过 SSH 转发时，如果两端版本不一致，或者网络传输延迟，连接很容易断开，报出 The X11 connection broke。
+Headless 模式的冲突： 如果服务器检测到没有物理显示器，它有时会默认跳转到 Agg（不弹窗模式）。但通过 SSH 开启了 X11 转发会导致它在尝试初始化图形界面时发生崩溃。
+TkAgg 使用的是 Python 自带的 Tkinter 图形库。
+协议简单： Tk 库使用的是非常基础、古老且标准的 X11 协议。它对网络波动的容忍度比 Qt 高得多，非常适合通过 SSH 隧道传输。
+兼容性强： 几乎所有的 Linux X11 环境都完美支持 Tk 协议。
+轻量化： 它不需要加载几百 MB 的 Qt 库，启动速度快，数据包更小。
 """
 import argparse
 import os
@@ -28,6 +40,8 @@ import sys
 import cv2
 import mrcfile
 import numpy as np
+import matplotlib
+matplotlib.use('TkAgg') # 或者 'Qt5Agg'
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from pathlib import Path
@@ -139,7 +153,7 @@ class Viewer:
             if xs and ys:
                 self.ax.scatter(xs, ys, s=7, c="yellow", marker="x")
         self.ax.set_xlim(0, w)
-        self.ax.set_ylim(h, 0)
+        self.ax.set_ylim(0, h)
         # self.ax.set_ylim(0, h)
         self.fig.canvas.draw_idle()
 
