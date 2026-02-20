@@ -159,57 +159,69 @@ def _normalize(v: np.ndarray) -> np.ndarray:
     return (v / n).astype(np.float32)
 
 
-def make_frame(direction_xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    n = _normalize(direction_xyz)
-    helper = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    if abs(float(np.dot(n, helper))) > 0.9:
-        helper = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-    u = _normalize(np.cross(n, helper))
-    v = _normalize(np.cross(n, u))
-    return u, v, n
-
-
-def update_frame(prev_u: np.ndarray, prev_v: np.ndarray, direction_xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    n = _normalize(direction_xyz)
-    u = prev_u - n * float(np.dot(prev_u, n))
-    if np.linalg.norm(u) < 1e-6:
-        return make_frame(n)
-    u = _normalize(u)
-    v = _normalize(np.cross(n, u))
-    if float(np.dot(v, prev_v)) < 0:
-        v = -v
-        u = -u
-    return u, v, n
-
-
 def _xyz_inside(shape_zyx: Tuple[int, int, int], p_xyz: np.ndarray) -> bool:
     x, y, z = p_xyz
     zmax, ymax, xmax = shape_zyx
     return (0 <= x < xmax) and (0 <= y < ymax) and (0 <= z < zmax)
 
 
-def sample_plane_slice(
-    vol_zyx: np.ndarray,
-    center_xyz: np.ndarray,
-    u_xyz: np.ndarray,
-    v_xyz: np.ndarray,
-    half_u_px: float,
-    half_v_px: float,
-    out_w: int,
-    out_h: int,
-) -> np.ndarray:
-    # 在局部平面 (u, v) 上重采样 2D 切片。
-    us = np.linspace(-half_u_px, half_u_px, out_w, dtype=np.float32)
-    vs = np.linspace(-half_v_px, half_v_px, out_h, dtype=np.float32)
-    uu, vv = np.meshgrid(us, vs, indexing="xy")
-    xyz = (
-        center_xyz[None, None, :]
-        + uu[..., None] * u_xyz[None, None, :]
-        + vv[..., None] * v_xyz[None, None, :]
-    )
-    coords_zyx = np.stack([xyz[..., 2], xyz[..., 1], xyz[..., 0]], axis=0)
+def _pick_axis_plane(direction_xyz: np.ndarray) -> Tuple[str, int, int]:
+    """
+    按前进方向选择轴对齐切面：
+    - 主要沿 Z -> 用 XY（法向 z）
+    - 主要沿 Y -> 用 XZ（法向 y）
+    - 主要沿 X -> 用 YZ（法向 x）
+    """
+    d = np.abs(_normalize(direction_xyz))
+    axis = int(np.argmax(d))
+    sign = 1 if float(direction_xyz[axis]) >= 0 else -1
+    if axis == 2:
+        return "xy", 2, sign
+    if axis == 1:
+        return "xz", 1, sign
+    return "yz", 0, sign
+
+
+def sample_axis_slice(vol_zyx: np.ndarray, center_xyz: np.ndarray, plane: str, half: float, out_size: int) -> np.ndarray:
+    """采样轴对齐切片。输出约定：xy(row=y,col=x), xz(row=z,col=x), yz(row=z,col=y)。"""
+    t = np.linspace(-half, half, out_size, dtype=np.float32)
+    rr, cc = np.meshgrid(t, t, indexing="xy")
+    cx, cy, cz = float(center_xyz[0]), float(center_xyz[1]), float(center_xyz[2])
+
+    if plane == "xy":
+        x = cx + cc
+        y = cy + rr
+        z = np.full_like(x, cz, dtype=np.float32)
+    elif plane == "xz":
+        x = cx + cc
+        z = cz + rr
+        y = np.full_like(x, cy, dtype=np.float32)
+    else:  # yz
+        y = cy + cc
+        z = cz + rr
+        x = np.full_like(y, cx, dtype=np.float32)
+
+    coords_zyx = np.stack([z, y, x], axis=0)
     sl = ndi.map_coordinates(vol_zyx, coords_zyx, order=1, mode="nearest")
     return sl.astype(np.float32)
+
+
+def sample_axis_slice_merged(
+    vol_zyx: np.ndarray,
+    center_xyz: np.ndarray,
+    plane: str,
+    normal_axis: int,
+    half: float,
+    out_size: int,
+    merge_step: int,
+) -> np.ndarray:
+    """沿法向前后各 merge_step 张切片平均，提升 cc 信噪比。"""
+    acc = np.zeros((out_size, out_size), dtype=np.float32)
+    for k in range(-merge_step, merge_step + 1):
+        p = np.asarray(center_xyz, dtype=np.float32).copy()
+        p[normal_axis] += float(k)
+        acc += sample_axis_slice(vol_zyx, p, plane, half, out_size)
+    return acc / float(2 * merge_step + 1)
 
 
 def trace_fiber_crosscorr(
@@ -234,50 +246,44 @@ def trace_fiber_crosscorr(
     if total_len < 1e-4:
         return np.vstack([start_xyz, end_xyz]).astype(np.float32)
 
-    # --step 改为“切片合并半窗”参数。
-    advance_px = merge_step + 1
-    n_steps = max(3, int(np.ceil(total_len / advance_px)))
     merge_step = max(0, int(merge_step))
+    # 严格轴向步进：先固定主轴，再只沿该轴每次前进 merge_step + 1 像素。
+    plane, normal_axis, axis_sign = _pick_axis_plane(direction)
+    axis_step = axis_sign * (merge_step + 1)
+    axis_span = abs(float(direction[normal_axis]))
+    n_steps = max(2, int(axis_span / axis_step))
 
-    # 取消椭圆与掩膜，按正圆设置切片窗口大小。
-    circle_radius = max(1.0, float(radius_px))
-    margin = max(1.0, float(radius_px) * float(margin_ratio))
-    half_u = circle_radius + margin
-    half_v = circle_radius + margin
-
-    out_w = int(np.ceil(2 * half_u)) + 1
-    out_h = int(np.ceil(2 * half_v)) + 1
-
-    u, v, n = make_frame(direction)
+    half = max(1.0, radius_px) + max(1.0, radius_px * margin_ratio)
+    out_size = int(np.ceil(2 * half)) + 1
     centers = [start_xyz.copy()]
     center = start_xyz.copy()
-
-    prev_slice_acc = np.zeros((out_h, out_w), dtype=np.float32)
-    for k in range(-merge_step, merge_step + 1):
-        p = center + float(k) * n
-        prev_slice_acc += sample_plane_slice(vol_zyx, p, u, v, half_u, half_v, out_w, out_h)
-    prev_slice = prev_slice_acc / float(2 * merge_step + 1)
 
     for i in range(1, n_steps):
         t = i / float(n_steps)
         guide = start_xyz + t * (end_xyz - start_xyz)
 
-        pred = center + n * advance_px
-        pred = (1.0 - guide_weight) * pred + guide_weight * guide
+        pred = center.copy()
+        pred[normal_axis] += axis_step  # debug from here
         if not _xyz_inside(vol_zyx.shape, pred):
             pred = np.clip(pred, [0, 0, 0], [vol_zyx.shape[2] - 1, vol_zyx.shape[1] - 1, vol_zyx.shape[0] - 1])
 
-        cur_slice_acc = np.zeros((out_h, out_w), dtype=np.float32)
-        for k in range(-merge_step, merge_step + 1):
-            p = pred + float(k) * n
-            cur_slice_acc += sample_plane_slice(vol_zyx, p, u, v, half_u, half_v, out_w, out_h)
-        cur_slice = cur_slice_acc / float(2 * merge_step + 1)
+        prev_slice = sample_axis_slice_merged(vol_zyx, center, plane, normal_axis, half, out_size, merge_step)
+        cur_slice = sample_axis_slice_merged(vol_zyx, pred, plane, normal_axis, half, out_size, merge_step)
 
         shift, error, _ = phase_cross_correlation(prev_slice, cur_slice, upsample_factor=max(1, int(cc_upsample)))
         shift_row, shift_col = float(shift[0]), float(shift[1])
 
-        # 将切片平移量映射回 3D：col 对应 u，row 对应 v；取负号用于修正预测中心。
-        corr_xyz = (-shift_col) * u + (-shift_row) * v
+        # 将 2D shift 映射回 xyz（按当前切面定义）。
+        corr_xyz = np.zeros(3, dtype=np.float32)
+        if plane == "xy":
+            corr_xyz[0] = -shift_col
+            corr_xyz[1] = -shift_row
+        elif plane == "xz":
+            corr_xyz[0] = -shift_col
+            corr_xyz[2] = -shift_row
+        else:  # yz
+            corr_xyz[1] = -shift_col
+            corr_xyz[2] = -shift_row
         max_corr = max(1.0, radius_px * 0.8)
         corr_norm = float(np.linalg.norm(corr_xyz))
         if corr_norm > max_corr:
@@ -290,22 +296,24 @@ def trace_fiber_crosscorr(
             corr_xyz *= 0.45
 
         next_center = pred + corr_xyz
-        # 只保留较弱的直线引导，避免把曲线强行拉直。
-        blend = guide_weight * (1.0 if error <= 0.5 else 1.5)
-        blend = float(np.clip(blend, 0.0, 0.35))
-        next_center = (1.0 - blend) * next_center + blend * guide
+        # 轴向保持严格步进；引导仅作用在切面内两个横向分量，避免整体漂移。
+        blend = float(np.clip(guide_weight, 0.0, 0.35))
+        if plane == "xy":
+            next_center[0] = (1.0 - blend) * next_center[0] + blend * guide[0]
+            next_center[1] = (1.0 - blend) * next_center[1] + blend * guide[1]
+            next_center[2] = pred[2]
+        elif plane == "xz":
+            next_center[0] = (1.0 - blend) * next_center[0] + blend * guide[0]
+            next_center[2] = (1.0 - blend) * next_center[2] + blend * guide[2]
+            next_center[1] = pred[1]
+        else:  # yz
+            next_center[1] = (1.0 - blend) * next_center[1] + blend * guide[1]
+            next_center[2] = (1.0 - blend) * next_center[2] + blend * guide[2]
+            next_center[0] = pred[0]
         next_center = np.clip(next_center, [0, 0, 0], [vol_zyx.shape[2] - 1, vol_zyx.shape[1] - 1, vol_zyx.shape[0] - 1])
 
         centers.append(next_center.astype(np.float32))
-        new_dir = _normalize(next_center - center + 0.25 * (end_xyz - start_xyz) / n_steps)
-        u, v, n = update_frame(u, v, new_dir)
-
         center = next_center
-        prev_slice_acc = np.zeros((out_h, out_w), dtype=np.float32)
-        for k in range(-merge_step, merge_step + 1):
-            p = center + float(k) * n
-            prev_slice_acc += sample_plane_slice(vol_zyx, p, u, v, half_u, half_v, out_w, out_h)
-        prev_slice = prev_slice_acc / float(2 * merge_step + 1)
 
     centers.append(end_xyz.copy())
     pts = np.asarray(centers, dtype=np.float32)
