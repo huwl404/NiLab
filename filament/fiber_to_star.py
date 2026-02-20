@@ -17,10 +17,18 @@
 - radius/spacing 单位为 Å（埃）
 - 支持在 ChimeraX 中运行或独立命令行运行
 - 参考算法：Automated picking of amyloid fibrils (FibrilFinder), PMC8217313
+
+预处理与增强方案（调研结论）：
+- 3D Kuwahara 逐体素 Python 回调极慢，默认关闭（--kuwahara-radius 0）；降噪以 Gaussian 为主。
+- 纤维在 cryo-ET 中常为较暗、连续密度；卷积前可用 --invert 将暗纤维变亮再卷积。
+- 若圆柱卷积后响应多为噪声，可改用 --enhance frangi：基于 Hessian 二阶导的管状增强（skimage），
+  对 3D 体积较快，且直接将纤维信号转为亮响应，无需底帽与圆柱核。
 """
 from __future__ import annotations
 
 import argparse
+import multiprocessing
+import re
 import struct
 import sys
 from pathlib import Path
@@ -143,6 +151,72 @@ def read_star_fibers(star_path: Path,) -> Tuple[List[Tuple[np.ndarray, np.ndarra
     # 检查是否有孤立的起始点（行数为奇数）
     has_orphan = (len(coords) % 2) == 1
     return fibers, has_orphan
+
+
+# 多进程 worker 用到的全局状态（由 initializer 注入，避免 pickle 局部函数与体积）
+_worker_vol: Optional[np.ndarray] = None
+_worker_fibers: Optional[List] = None
+_worker_fit_kw: Optional[dict] = None
+_worker_save_mrc: bool = False
+_worker_data_dir: Optional[Path] = None
+_worker_star_path: Optional[Path] = None
+
+
+def _init_fit_worker(vol: np.ndarray, fibers: List, fit_kw: dict, save_mrc: bool, data_dir: Path, star_path: Path,) -> None:
+    """Pool initializer：在每个子进程中注入体积与参数，供 _fit_one_fiber_worker 使用。"""
+    global _worker_vol, _worker_fibers, _worker_fit_kw, _worker_save_mrc, _worker_data_dir, _worker_star_path
+    _worker_vol = vol
+    _worker_fibers = fibers
+    _worker_fit_kw = fit_kw
+    _worker_save_mrc = save_mrc
+    _worker_data_dir = data_dir
+    _worker_star_path = star_path
+
+
+def _fit_one_fiber_worker(idx: int) -> Tuple[int, np.ndarray, Tuple]:
+    """模块级 worker：仅接收纤维索引，从全局状态读体积与参数；可被 multiprocessing 序列化。"""
+    start_xyz, end_xyz, start_ang, end_ang = _worker_fibers[idx]
+    debug_prefix = str(_worker_data_dir / f"{_worker_star_path.stem}_fiber{idx}") if _worker_save_mrc else None
+    curve = fit_fiber_convolve(_worker_vol, start_xyz, end_xyz, debug_mrc_prefix=debug_prefix, **_worker_fit_kw)
+    return (idx, curve, (start_xyz, end_xyz, start_ang, end_ang))
+
+
+def _parse_fiber_index_list(spec: Optional[str], n_fibers: int) -> List[int]:
+    """
+    解析 --fiber-index 的逗号分隔列表，支持单值或范围（如 0,2,5 或 0,1-3）。
+    返回在 [0, n_fibers) 内的唯一、排序的索引列表。
+    """
+    if spec is None or (isinstance(spec, str) and not spec.strip()):
+        return list(range(n_fibers))
+    if isinstance(spec, int):
+        return [spec] if 0 <= spec < n_fibers else []
+    seen: set[int] = set()
+    for part in re.split(r"\s*,\s*", str(spec).strip()):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part and part.count("-") == 1:
+            a, b = part.split("-", 1)
+            try:
+                lo, hi = int(a.strip()), int(b.strip())
+                for i in range(lo, hi + 1):
+                    if 0 <= i < n_fibers:
+                        seen.add(i)
+            except ValueError:
+                try:
+                    i = int(part)
+                    if 0 <= i < n_fibers:
+                        seen.add(i)
+                except ValueError:
+                    pass
+        else:
+            try:
+                i = int(part)
+                if 0 <= i < n_fibers:
+                    seen.add(i)
+            except ValueError:
+                pass
+    return sorted(seen)
 
 
 # ========== 体积加载与卷积拟合（参考 FibrilFinder 算法）==========
@@ -396,69 +470,24 @@ def _gaussian_filter_3d(roi: np.ndarray, sigma: float) -> np.ndarray:
     return gaussian_filter(roi, sigma=sigma, mode="reflect").astype(np.float32)
 
 
-def _kuwahara_2d(slice_2d: np.ndarray, window_radius: int) -> np.ndarray:
+def _frangi_3d(roi: np.ndarray, radius_px: float, debug_mrc_prefix: Optional[str], voxel_size: float) -> np.ndarray:
     """
-    2D Kuwahara：将每个像素替换为 4 个重叠象限中方差最小的那个的均值。
-    用于按 z 切片调用以替代 3D generic_filter（3D 逐体素 Python 回调极慢）。
+    3D Frangi 管状增强（Hessian 特征值，二阶导）：增强管状/纤维结构，输出在纤维处较亮。
+    使用 skimage.filters.frangi，多尺度由 radius_px 推导；无 skimage 时退回高斯平滑。
     """
-    from scipy.ndimage import generic_filter
-    n = 2 * window_radius + 1
-
-    def _quadrant_fn(values: np.ndarray) -> float:
-        v = values.reshape(n, n)
-        r = window_radius
-        best_mean = float(values[0])
-        best_var = np.inf
-        # 4 个重叠象限（标准 Kuwahara 划分）
-        for iy in (0, 1):
-            for ix in (0, 1):
-                y0, y1 = (0, r + 1) if iy == 0 else (r + 1, n)
-                x0, x1 = (0, r + 1) if ix == 0 else (r + 1, n)
-                region = v[y0:y1, x0:x1]
-                if region.size == 0:
-                    continue
-                m = float(region.mean())
-                var = float(region.var())
-                if var < best_var:
-                    best_var = var
-                    best_mean = m
-        return best_mean
-
-    return generic_filter(slice_2d.astype(np.float64), _quadrant_fn, size=(n, n), mode="reflect").astype(np.float32)
-
-
-def _kuwahara_3d(roi: np.ndarray, window_radius: int) -> np.ndarray:
-    """
-    3D 体积上的 Kuwahara：按 z 切片做 2D Kuwahara 再堆叠。
-    纯 3D 八分体 + generic_filter 会逐体素调用 Python，百万次量级导致数分钟无输出，
-    可调参数：window_radius，同 _kuwahara_2d，原文320px的micrograph使用 60 px。
-    """
-    out = np.empty_like(roi, dtype=np.float32)
-    for z in range(roi.shape[0]):
-        out[z] = _kuwahara_2d(roi[z], window_radius)
-    return out
-
-
-def _bottom_hat_3d(roi: np.ndarray, structure_radius: int) -> np.ndarray:
-    """
-    3D 底帽变换：closing(roi) - roi，用于去除缓慢强度变化、突出比背景暗的结构（纤维）。
-        structure_radius: 形态学结构元半径（像素）。越大去除的“缓慢变化”尺度越大，
-            - 纤维与背景的对比越干净；过大会模糊纤维边界。
-            - 3D 中可用较小值，例如 3~8，原文320px的micrograph使用 300 px。
-    """
-    from scipy.ndimage import grey_closing
     try:
-        from skimage.morphology import ball
-        structure = ball(structure_radius)
+        from skimage.filters import frangi
     except ImportError:
-        # 无 skimage 时用立方体结构元
-        print("warning: skimage not found, using cubic structure element.")
-        s = 2 * structure_radius + 1
-        structure = np.ones((s, s, s), dtype=np.float64)
-    closed = grey_closing(roi.astype(np.float64), structure=structure, mode="reflect")
-    # 底帽 = closing - 原图；纤维（暗）处 closing > 原图，底帽为正，纤维在预处理后为“亮”便于卷积
-    out = closed - roi.astype(np.float64)
-    return out.astype(np.float32)
+        print("warning: skimage not found, Frangi enhancement disabled; using Gaussian-smoothed volume.")
+        return _gaussian_filter_3d(roi, max(1.0, 0.5 * radius_px))
+    # 多尺度：与纤维半径同量级的 sigma 列表（3～5 个尺度）
+    n_sigmas = min(5, max(3, int(radius_px * 0.15)))
+    sigmas = np.linspace(max(0.5, radius_px * 0.2), max(2.0, radius_px * 0.7), n_sigmas)
+    sigmas = np.unique(sigmas).tolist()
+    if not sigmas:
+        sigmas = [max(1.0, radius_px * 0.5)]
+    out = frangi(roi.astype(np.float64), sigmas=sigmas, black_ridges=False)
+    return np.asarray(out, dtype=np.float32)
 
 
 def make_cylinder_kernel(radius_px: float, length_px: float) -> np.ndarray:
@@ -531,35 +560,24 @@ def fit_fiber_convolve(
     norm_percentile_low: float = 2.0,
     norm_percentile_high: float = 98.0,
     gaussian_sigma: Optional[float] = None,
-    kuwahara_radius: int = 3,
-    bottomhat_radius: int = 5,
     convolution_mode: str = "reflect",
+    use_invert: bool = False,
+    enhance: str = "conv",
 ) -> np.ndarray:
     """
-    使用卷积方法拟合纤维的 3D 路径（基于 FibrilFinder 算法）。
+    使用卷积或 Hessian 管状增强方法拟合纤维的 3D 路径（基于 FibrilFinder + 可选 Frangi）。
     
     算法流程：
     1. ROI 裁剪：提取包含纤维的局部区域
     2. 坐标旋转：将纤维方向对齐到 z 轴
-    3. 预处理：归一化 → 3D Gaussian → 3D Kuwahara → 3D Bottom-hat（纤维为暗结构）
-    4. 卷积增强：用圆柱核卷积，增强纤维状结构
+    3. 预处理：归一化 → [可选取反] → 3D Gaussian → [可选 Kuwahara] → [conv 时: Bottom-hat] 或 [frangi 时: 无]
+    4. 增强：conv=圆柱核卷积；frangi=Hessian 管状响应（二阶导，纤维变亮）
     5. 二值化 → 侵蚀（可选）→ 骨架化 → 样条拟合
     
     参数:
-        vol, start, end, radius_px: 体积与纤维起止点、半径（像素）
-        threshold_percentile: 二值化百分位 (0-100)，越高越严格
-        curvature: 曲率 [0,1]，0 最直、1 最弯
-        length_scale: ROI 边距 = radius_px * length_scale
-        erode_iterations: 形态学侵蚀次数，>0 可去细小分支
-        norm_percentile_low, norm_percentile_high: 归一化前百分位裁剪，避免极值拉偏。
-            - (2, 98) 稳健；(0, 100) 不裁剪。
-        gaussian_sigma: 高斯滤波标准差（像素）。None 时用 max(1.0, 0.5*radius_px)。
-            - 越大越平滑、边缘越糊；过小降噪不足。
-        kuwahara_radius: 3D Kuwahara 窗口半宽（像素），窗口 (2*radius+1)^3。
-            - 越大越平滑、边缘保留越好但更慢；建议与纤维半径同量级。
-        bottomhat_radius: 3D 底帽结构元半径（像素）。越大去除缓慢变化越强。
-            - 过大会模糊纤维边界。
-        convolution_mode: 卷积边界模式。"reflect" 减轻棱边伪影；可选 "nearest", "constant" 等。
+        use_invert: 归一化后取反，使暗纤维变亮（cryo-ET 中纤维常为低密度）。
+        enhance: "conv"=圆柱卷积（默认）；"frangi"=skimage Frangi 管状增强（基于 Hessian，对 3D 较快）。
+        kuwahara_radius: ≤0 时跳过 Kuwahara（默认 0，因 3D 极慢）；>0 时启用（慢）。
     """
     from scipy.ndimage import convolve
     from scipy.interpolate import UnivariateSpline
@@ -570,6 +588,9 @@ def fit_fiber_convolve(
     if roi.size == 0:
         print("warning: ROI is empty, returning straight line.")
         return np.array([start, end])
+    
+    if debug_mrc_prefix is not None:
+        save_mrc(f"{debug_mrc_prefix}_0_roi.mrc", roi, voxel_size)
 
     # ========== 步骤 2: 坐标旋转 ==========
     v = end - start
@@ -577,43 +598,39 @@ def fit_fiber_convolve(
     R = rotation_matrix_from_z_to_vector(v)
     roi_rot = apply_rotation_to_volume(roi, R, origin)
 
-    # ========== 步骤 2.5: 卷积前预处理（归一化 + Gaussian + Kuwahara + Bottom-hat）==========
-    # 归一化：使不同 ROI 尺度一致，减轻“只有棱边有信号”
+    # ========== 步骤 3: 卷积前预处理 ==========
     roi_pre = _normalize_roi(roi_rot, percentile_low=norm_percentile_low, percentile_high=norm_percentile_high, use_std=True,)
-    if debug_mrc_prefix is not None:  # 1
-        save_mrc(f"{debug_mrc_prefix}_norm.mrc", roi_pre, voxel_size)
+    if debug_mrc_prefix is not None:
+        save_mrc(f"{debug_mrc_prefix}_1_norm.mrc", roi_pre, voxel_size)
 
-    # 3D Gaussian：提高信噪比。可调：gaussian_sigma 越大越平滑
-    sigma = gaussian_sigma if gaussian_sigma is not None else max(1.0, 0.5 * radius_px)
+    if use_invert:
+        roi_pre = -roi_pre
+        if debug_mrc_prefix is not None:
+            save_mrc(f"{debug_mrc_prefix}_2_invert.mrc", roi_pre, voxel_size)
+
+    sigma = gaussian_sigma if gaussian_sigma is not None else max(1.0, radius_px)
     roi_pre = _gaussian_filter_3d(roi_pre, sigma)
-    if debug_mrc_prefix is not None:  # 2
-        save_mrc(f"{debug_mrc_prefix}_gaussian.mrc", roi_pre, voxel_size)
+    if debug_mrc_prefix is not None:
+        save_mrc(f"{debug_mrc_prefix}_3_gaussian.mrc", roi_pre, voxel_size)
 
-    # 3D Kuwahara：降噪且保留边缘。可调：kuwahara_radius 越大越平滑、计算越慢
-    roi_pre = _kuwahara_3d(roi_pre, kuwahara_radius)
-    if debug_mrc_prefix is not None:  # 3
-        save_mrc(f"{debug_mrc_prefix}_kuwahara.mrc", roi_pre, voxel_size)
-        
-    # 3D Bottom-hat：突出比背景暗的纤维。可调：bottomhat_radius 越大去缓慢变化越强
-    roi_pre = _bottom_hat_3d(roi_pre, bottomhat_radius)
-    if debug_mrc_prefix is not None:  # 4
-        save_mrc(f"{debug_mrc_prefix}_bottomhat.mrc", roi_pre, voxel_size)
-
-    # ========== 步骤 3: 卷积增强 ==========
-    length_px = max(4, radius_px * 2)
-    kernel = make_cylinder_kernel(radius_px, length_px)
-    # 使用 reflect 减轻 ROI 棱边虚假高响应；可调：convolution_mode 可选 "nearest", "constant" 等
-    try:
-        if convolution_mode == "constant":
-            resp = convolve(roi_pre, kernel, mode="constant", cval=0.0)
-        else:
-            resp = convolve(roi_pre, kernel, mode=convolution_mode)
-    except Exception:
-        print("warning: convolution failed, using preprocessed volume.")
-        resp = roi_pre
-
-    if debug_mrc_prefix is not None:  # 5
-        save_mrc(f"{debug_mrc_prefix}_conv.mrc", resp, voxel_size)
+    if enhance == "frangi":
+        # Hessian 管状增强：纤维（亮或经 invert 后变亮）处响应高，无需底帽与圆柱卷积
+        resp = _frangi_3d(roi_pre, radius_px, debug_mrc_prefix, voxel_size)
+        if debug_mrc_prefix is not None:
+            save_mrc(f"{debug_mrc_prefix}_4_frangi.mrc", resp, voxel_size)
+    else:
+        length_px = max(4, radius_px * 2)
+        kernel = make_cylinder_kernel(radius_px, length_px)
+        try:
+            if convolution_mode == "constant":
+                resp = convolve(roi_pre, kernel, mode="constant", cval=0.0)
+            else:
+                resp = convolve(roi_pre, kernel, mode=convolution_mode)
+            if debug_mrc_prefix is not None:
+                save_mrc(f"{debug_mrc_prefix}_4_conv.mrc", resp, voxel_size)
+        except Exception:
+            print("warning: convolution failed, using preprocessed volume.")
+            resp = roi_pre
 
     # ========== 步骤 4: 二值化 ==========
     # 根据百分位阈值将卷积响应转为二值掩码
@@ -621,9 +638,8 @@ def fit_fiber_convolve(
     # 值越高越严格，只保留最强的信号
     th = np.percentile(resp[np.isfinite(resp)], threshold_percentile)
     binary = (resp >= th).astype(np.uint8)
-
-    if debug_mrc_prefix is not None:  # 6
-        save_mrc(f"{debug_mrc_prefix}_binary.mrc", binary, voxel_size)
+    if debug_mrc_prefix is not None:
+        save_mrc(f"{debug_mrc_prefix}_5_binary.mrc", binary, voxel_size)
 
     # ========== 步骤 5: 侵蚀（可选）==========
     # 形态学侵蚀：去除细小分支和噪声，使纤维更连续
@@ -640,8 +656,8 @@ def fit_fiber_convolve(
             print("warning: erosion failed, skipping.")
             pass
     
-    if debug_mrc_prefix is not None:  # 7
-        save_mrc(f"{debug_mrc_prefix}_binary_eroded.mrc", binary, voxel_size)
+    if debug_mrc_prefix is not None:
+        save_mrc(f"{debug_mrc_prefix}_6_binary_eroded.mrc", binary, voxel_size)
 
     # ========== 步骤 6: 骨架化 ==========
     # 提取二值掩码的中心线（3D skeleton），骨架点即为纤维中心线
@@ -671,8 +687,8 @@ def fit_fiber_convolve(
         print("warning: no skeleton points found, using volume center.")
         pts_zyx = np.array([[resp.shape[0] // 2, resp.shape[1] // 2, resp.shape[2] // 2]])
     
-    if debug_mrc_prefix is not None:  # 8
-        save_mrc(f"{debug_mrc_prefix}_pts_zyx.mrc", pts_zyx, voxel_size)
+    if debug_mrc_prefix is not None:
+        save_mrc(f"{debug_mrc_prefix}_7_pts_zyx.mrc", pts_zyx, voxel_size)
 
     # 将骨架点从旋转后的 ROI 坐标转换回全局坐标
     # 步骤：(z,y,x) → (x,y,z) → 去中心化 → 逆旋转 → 平移到全局
@@ -1025,6 +1041,15 @@ def write_axm(path: Path, curve: np.ndarray, voxel_size: float, degree: int = 3,
     格式与 ArtiaX CurvedLine.write_file 一致（内部为 npz）：model_type, particle_pos, degree,
     smooth, resolution, points (3×n), der_points (3×n)。通过 open(..., 'wb') 写入，保证文件后缀为 .axm
     而非 .npz。在 ArtiaX 中通过 Geometric Models → Open Geomodel... 选择本文件打开。
+    | 参数名称               | 含义说明                                         |
+    | :----------------- | :------------------------------------------- |
+    | **`model_type`**   | 必须为 `"CurvedLine"`，ArtiaX 据此识别模型类型并调用相应的渲染类。 |
+    | **`particle_pos`** | 原始颗粒坐标列表。在 ArtiaX 中，这些点用于定义曲线的控制点。           |
+    | **`degree`**       | 样条曲线的阶数（通常为 3），决定了曲线的平滑程度。                   |
+    | **`smooth`**       | 样条拟合的平滑参数。`0` 表示曲线必须经过所有 `particle_pos` 点。   |
+    | **`resolution`**   | 渲染分辨率，即在控制点之间插值生成的显示点数量。                     |
+    | **`points`**       | 预计算的曲线采样点坐标，形状为 `(3, n)`。ArtiaX 渲染时直接使用这些点。  |
+    | **`der_points`**   | 曲线各点处的导数（切向量），形状为 `(3, n)`，用于计算颗粒的取向。        |
     
     参考: https://github.com/FrangakisLab/ArtiaX/blob/main/src/geometricmodel/CurvedLine.py
     """
@@ -1108,6 +1133,10 @@ Examples:
   
   # adjust parameters for a single fiber
   python fiber_to_star.py --star fiber.star --rec volume.rec --voxel-size 14.5 --fiber-index 1 --curvature 0.2 --threshold 80 --erode 2
+  
+  # multiple fibers and parallel workers (fiber-index comma-separated or range)
+  python fiber_to_star.py --star fiber.star --rec volume.rec --voxel-size 14.5 --fiber-index 0,2,5 --workers 4 --no-open
+  python fiber_to_star.py --star fiber.star --rec volume.rec --voxel-size 14.5 --fiber-index 0,1-3 --enhance frangi --invert --no-open
         """
     )
     
@@ -1121,6 +1150,7 @@ Examples:
     parser.add_argument("--curvature", type=float, default=0.1, help="curvature [0,1], 0=straightest (strong smoothing), 1=tightest (follows skeleton), default 0.1")
     parser.add_argument("--threshold", type=float, default=75.0, help="binarization percentile (0-100), default 75, higher values are stricter")
     parser.add_argument("--erode", type=int, default=1, help="erode iterations after binarization, default 1, try 2-3 for discontinuous fibers")
+    parser.add_argument("--curve-points", type=int, default=10, help="number of points per fitted curve (default 10, reduce for speed)")
     
     # ===== 输出模式（二选一）=====
     parser.add_argument("--spacing", type=float, default=40, help="equidistant sampling step (Å), default 40 (equidistant mode)")
@@ -1128,18 +1158,23 @@ Examples:
     parser.add_argument("--out", default=None, help="output .star file path (only when this parameter is specified, generate particle .star file)")
     
     # ===== 其他选项 =====
-    # 卷积前预处理（归一化 + Gaussian + Kuwahara + Bottom-hat）
-    parser.add_argument("--gaussian-sigma", type=float, default=None, metavar="F", help="pre-conv Gaussian sigma (px); default max(1, 0.5*radius_px)")
-    parser.add_argument("--kuwahara-radius", type=int, default=3, metavar="N", help="3D Kuwahara window half-size (px), default 3")
-    parser.add_argument("--bottomhat-radius", type=int, default=5, metavar="N", help="3D bottom-hat structure radius (px), default 5")
+    # 卷积前预处理
+    parser.add_argument("--gaussian-sigma", type=float, default=None, metavar="F", help="pre-conv Gaussian sigma (px); default max(1, radius_px)")
+    parser.add_argument("--invert", action="store_true", help="invert density after norm so dark fiber becomes bright (cryo-ET)")
+    parser.add_argument("--enhance", choices=("conv", "frangi"), default="conv", help="enhancement: conv=cylinder conv (default), frangi=Hessian vesselness (tubular)")
     parser.add_argument("--conv-mode", default="reflect", choices=("reflect", "nearest", "constant"), help="convolution border mode, default reflect")
 
-    parser.add_argument("--curve-points", type=int, default=10, help="number of points per fitted curve (default 10, reduce for speed)")
-    parser.add_argument("--fiber-index", type=int, default=None, metavar="N", help="if set, only fit and output fiber N (0-based); omit to process all fibers")
+    parser.add_argument("--fiber-index", default=None, metavar="N[,M,...]", help="comma-separated 0-based indices (e.g. 0,2,5 or 0,1-3); omit to process all fibers")
+    parser.add_argument("--workers", type=int, default=8, metavar="W", help="number of parallel workers for fitting (default ); capped by number of fibers to fit")
     parser.add_argument("--no-open", action="store_true", help="not automatically open results in ChimeraX (standalone mode)")
     parser.add_argument("--save-mrc", action="store_true", help="save intermediate MRC files for debugging")
     
     args = parser.parse_args()
+
+    in_chimerax = _in_chimerax()
+    if in_chimerax and args.workers != 1:
+        args.workers = 1
+        print("running in ChimeraX: --workers forced to 1", file=sys.stderr)
 
     # ========== 参数验证与单位转换 ==========
     voxel = args.voxel_size
@@ -1185,58 +1220,70 @@ Examples:
     curvature = np.clip(args.curvature, 0.0, 1.0)
 
     # ========== 确定要拟合的纤维（--fiber-index 功能）==========
-    # 若指定 --fiber-index N 且 N 有效，仅拟合第 N 条纤维；否则拟合全部
-    if args.fiber_index is not None and 0 <= args.fiber_index < len(fibers):
-        indices_to_fit = [args.fiber_index]
-        print(f"fiber-index={args.fiber_index}: fitting only fiber {args.fiber_index}")
-    else:
+    # 解析逗号分隔的 index，支持单值或范围如 0,2,5 或 0,1-3；省略则处理全部
+    indices_to_fit = _parse_fiber_index_list(args.fiber_index, len(fibers))
+    if args.fiber_index is not None and not indices_to_fit:
+        print(f"warning: --fiber-index {args.fiber_index} produced no valid indices in [0, {len(fibers)}), fitting all fibers.", file=sys.stderr)
         indices_to_fit = list(range(len(fibers)))
-        if args.fiber_index is not None:
-            print(f"warning: --fiber-index {args.fiber_index} out of range [0, {len(fibers)}), fitting all fibers.", file=sys.stderr)
+    if not indices_to_fit:
+        indices_to_fit = list(range(len(fibers)))
+    n_fit = len(indices_to_fit)
+    n_workers = max(1, min(args.workers, n_fit))
+    if n_workers > 1:
+        print(f"fitting {n_fit} fiber(s) with {n_workers} workers (indices: {indices_to_fit})")
+    elif args.fiber_index is not None:
+        print(f"fiber-index={indices_to_fit}: fitting {n_fit} fiber(s)")
 
     # ========== 加载体积 ==========
     vol = load_volume(rec_path)
     print(f"loaded volume shape: {vol.shape} (Z, Y, X)")
     
     # ========== 拟合纤维 ==========
+    fit_kw = {
+        "radius_px": radius_px,
+        "threshold_percentile": args.threshold,
+        "curvature": curvature,
+        "erode_iterations": args.erode,
+        "curve_points": args.curve_points,
+        "voxel_size": args.voxel_size,
+        "gaussian_sigma": args.gaussian_sigma,
+        "use_invert": args.invert,
+        "enhance": args.enhance,
+        "convolution_mode": args.conv_mode,
+    }
     curves = []
-    fibers_fitted = []  # 与 curves 一一对应的 (start_xyz, end_xyz, start_ang, end_ang)
+    fibers_fitted = []
     axm_paths = []
-    for idx in indices_to_fit:
-        start_xyz, end_xyz, start_ang, end_ang = fibers[idx]
-        print(f"  fitting fiber {idx}: start {start_xyz} → end {end_xyz}")
 
-        if args.save_mrc:
-            debug_mrc_prefix = data_dir / f"{star_path.stem}_fiber{idx}"
-
-        curve = fit_fiber_convolve(
-            vol,
-            start_xyz,
-            end_xyz,
-            radius_px=radius_px,
-            threshold_percentile=args.threshold,
-            curvature=curvature,
-            erode_iterations=args.erode,
-            curve_points=args.curve_points,
-            debug_mrc_prefix=debug_mrc_prefix,
-            voxel_size=args.voxel_size,
-            gaussian_sigma=args.gaussian_sigma,
-            kuwahara_radius=args.kuwahara_radius,
-            bottomhat_radius=args.bottomhat_radius,
-            convolution_mode=args.conv_mode,
-        )
-        curves.append(curve)
-        fibers_fitted.append((start_xyz, end_xyz, start_ang, end_ang))
-        axm_path = data_dir / f"{star_path.stem}_fiber{idx}.axm"
-        write_axm(axm_path, curve, args.voxel_size)
-        axm_paths.append(axm_path)
-        print(f"    fitting completed, curve points: {len(curve)}, AXM file saved: {axm_path}")
+    if n_workers > 1:
+        # Windows 使用 spawn，只能 pickle 模块级函数；体积与参数通过 initializer 注入
+        with multiprocessing.Pool(n_workers, initializer=_init_fit_worker, initargs=(vol, fibers, fit_kw, args.save_mrc, data_dir, star_path)) as pool:
+            results = pool.map(_fit_one_fiber_worker, indices_to_fit)
+        results.sort(key=lambda r: r[0])
+        for idx, curve, fiber_tuple in results:
+            curves.append(curve)
+            fibers_fitted.append(fiber_tuple)
+            axm_path = data_dir / f"{star_path.stem}_fiber{idx}.axm"
+            write_axm(axm_path, curve, args.voxel_size)
+            axm_paths.append(axm_path)
+            print(f"  fiber {idx}: curve points {len(curve)}, AXM saved: {axm_path}")
+    else:
+        _init_fit_worker(vol, fibers, fit_kw, args.save_mrc, data_dir, star_path)
+        for idx in indices_to_fit:
+            start_xyz, end_xyz, start_ang, end_ang = fibers[idx]
+            print(f"  fitting fiber {idx}: start {start_xyz} → end {end_xyz}")
+            _, curve, _ = _fit_one_fiber_worker(idx)
+            curves.append(curve)
+            fibers_fitted.append((start_xyz, end_xyz, start_ang, end_ang))
+            axm_path = data_dir / f"{star_path.stem}_fiber{idx}.axm"
+            write_axm(axm_path, curve, args.voxel_size)
+            axm_paths.append(axm_path)
+            print(f"    fitting completed, curve points: {len(curve)}, AXM file saved: {axm_path}")
 
     # ========== ChimeraX 集成（若在 ChimeraX 中运行）==========
-    in_chimerax = _in_chimerax()
     if in_chimerax and not args.no_open and axm_paths:
         try:
-            from chimerax.core.commands import run as chimerax_run
+            from chimerax.core.commands import run as chimerax_run  # pyright: ignore[reportMissingImports]
             session = _get_session()
             if session:
                 for axm_path in axm_paths:
@@ -1320,7 +1367,7 @@ Examples:
     # ========== 在 ChimeraX 中打开生成的 STAR（若适用）==========
     if in_chimerax and not args.no_open and out_star is not None and out_star.exists():
         try:
-            from chimerax.core.commands import run as chimerax_run
+            from chimerax.core.commands import run as chimerax_run  # pyright: ignore[reportMissingImports]
             session = _get_session()
             if session:
                 # 在 ChimeraX 中打开 STAR 文件（需要 ArtiaX 插件支持）
