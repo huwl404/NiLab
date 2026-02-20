@@ -1,0 +1,604 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+基于二维切片互相关的纤维追踪：
+fiber start/end .star + .rec tomogram -> fiber tracing -> export .axm + particles .star
+
+设计要点：
+1) 不裁剪 ROI，直接在原始体积上进行切片采样与互相关追踪。
+2) 纤维截面按正圆近似，采样窗口由 radius + margin 控制。
+3) 提供体积增强（对比度与连续性）以应对断续纤维。
+4) --debug 打开时，将中间 mrc 输出到输入 rec 同目录。
+5) 支持按纤维多进程并行追踪。
+"""
+from __future__ import annotations
+
+import argparse
+import atexit
+import multiprocessing
+import os
+import sys
+from multiprocessing import shared_memory
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from scipy import ndimage as ndi
+from scipy.interpolate import splprep, splev
+
+try:
+    from skimage.registration import phase_cross_correlation
+except ImportError:
+    phase_cross_correlation = None
+
+try:
+    import mrcfile
+except ImportError:
+    mrcfile = None
+
+try:
+    import starfile
+except ImportError:
+    starfile = None
+
+
+def read_star_fibers(star_path: Path) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]], bool]:
+    if starfile is None:
+        raise ImportError("please install starfile: pip install starfile")
+    data = starfile.read(star_path, always_dict=True)
+    df = next(iter(data.values())) if isinstance(data, dict) else data
+
+    def col(name: str) -> Optional[str]:
+        for k in (f"_rln{name}", f"rln{name}", name):
+            if k in df.columns:
+                return k
+        return None
+
+    xc, yc, zc = col("CoordinateX"), col("CoordinateY"), col("CoordinateZ")
+    ra, ta, pa = col("AngleRot"), col("AngleTilt"), col("AnglePsi")
+    if not all((xc, yc, zc)):
+        raise ValueError("input .star missing CoordinateX/Y/Z columns")
+
+    coords = df[[xc, yc, zc]].to_numpy(dtype=np.float32)
+    angles = np.zeros((len(df), 3), dtype=np.float32)
+    if all((ra, ta, pa)):
+        angles = df[[ra, ta, pa]].to_numpy(dtype=np.float32)
+
+    fibers: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    for i in range(0, len(coords) - 1, 2):
+        fibers.append((coords[i], coords[i + 1], angles[i], angles[i + 1]))
+    return fibers, (len(coords) % 2 == 1)
+
+
+def parse_fiber_index_list(spec: Optional[str], n_fibers: int) -> List[int]:
+    if spec is None or str(spec).strip() == "":
+        return list(range(n_fibers))
+    out = set()
+    for part in str(spec).split(","):
+        s = part.strip()
+        if not s:
+            continue
+        if "-" in s and s.count("-") == 1:
+            a, b = s.split("-", 1)
+            try:
+                lo, hi = int(a), int(b)
+            except ValueError:
+                continue
+            for i in range(min(lo, hi), max(lo, hi) + 1):
+                if 0 <= i < n_fibers:
+                    out.add(i)
+        else:
+            try:
+                i = int(s)
+            except ValueError:
+                continue
+            if 0 <= i < n_fibers:
+                out.add(i)
+    return sorted(out)
+
+
+def load_volume(rec_path: Path) -> np.ndarray:
+    if mrcfile is None:
+        raise ImportError("please install mrcfile: pip install mrcfile")
+    with mrcfile.open(rec_path, permissive=True, mode="r") as m:
+        vol = np.asarray(m.data, dtype=np.float32)
+    if vol.ndim != 3:
+        raise ValueError(f"expected 3D volume, got shape={vol.shape}")
+    return vol
+
+
+def save_mrc(path: Path, data: np.ndarray, voxel_size: float = 1.0) -> None:
+    if mrcfile is None:
+        raise ImportError("please install mrcfile: pip install mrcfile")
+    with mrcfile.new(str(path), overwrite=True) as m:
+        m.set_data(np.asarray(data, dtype=np.float32))
+        try:
+            m.voxel_size = float(voxel_size)
+        except Exception:
+            pass
+
+
+def normalize_volume(vol: np.ndarray, low: float = 2.0, high: float = 98.0) -> np.ndarray:
+    lo, hi = np.percentile(vol, [low, high])
+    if hi <= lo:
+        return np.zeros_like(vol, dtype=np.float32)
+    x = (vol - lo) / (hi - lo)
+    return np.clip(x, 0.0, 1.0).astype(np.float32)
+
+
+def enhance_volume(
+    vol: np.ndarray,
+    voxel_size: float,
+    gaussian_sigma: float,
+    closing_size: int,
+    debug_mrc_prefix: Optional[str],
+) -> np.ndarray:
+    # 互相关前建议做轻量增强；低对比/断续纤维直接做互相关容易退化成直线。
+    x = normalize_volume(vol)
+    if debug_mrc_prefix is not None:
+        save_mrc(f"{debug_mrc_prefix}_1_normalize.mrc", x, voxel_size=voxel_size)
+
+    if gaussian_sigma > 0:
+        x = ndi.gaussian_filter(x, sigma=gaussian_sigma).astype(np.float32)
+        if debug_mrc_prefix is not None:
+            save_mrc(f"{debug_mrc_prefix}_2_gaussian.mrc", x, voxel_size=voxel_size)
+
+    if closing_size > 1:
+        s = int(closing_size)
+        x = ndi.grey_closing(x, size=(s, s, s)).astype(np.float32)
+        if debug_mrc_prefix is not None:
+            save_mrc(f"{debug_mrc_prefix}_3_closing.mrc", x, voxel_size=voxel_size)
+
+    return x
+
+
+def _normalize(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n < 1e-8:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    return (v / n).astype(np.float32)
+
+
+def make_frame(direction_xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = _normalize(direction_xyz)
+    helper = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    if abs(float(np.dot(n, helper))) > 0.9:
+        helper = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    u = _normalize(np.cross(n, helper))
+    v = _normalize(np.cross(n, u))
+    return u, v, n
+
+
+def update_frame(prev_u: np.ndarray, prev_v: np.ndarray, direction_xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = _normalize(direction_xyz)
+    u = prev_u - n * float(np.dot(prev_u, n))
+    if np.linalg.norm(u) < 1e-6:
+        return make_frame(n)
+    u = _normalize(u)
+    v = _normalize(np.cross(n, u))
+    if float(np.dot(v, prev_v)) < 0:
+        v = -v
+        u = -u
+    return u, v, n
+
+
+def _xyz_inside(shape_zyx: Tuple[int, int, int], p_xyz: np.ndarray) -> bool:
+    x, y, z = p_xyz
+    zmax, ymax, xmax = shape_zyx
+    return (0 <= x < xmax) and (0 <= y < ymax) and (0 <= z < zmax)
+
+
+def sample_plane_slice(
+    vol_zyx: np.ndarray,
+    center_xyz: np.ndarray,
+    u_xyz: np.ndarray,
+    v_xyz: np.ndarray,
+    half_u_px: float,
+    half_v_px: float,
+    out_w: int,
+    out_h: int,
+) -> np.ndarray:
+    # 在局部平面 (u, v) 上重采样 2D 切片。
+    us = np.linspace(-half_u_px, half_u_px, out_w, dtype=np.float32)
+    vs = np.linspace(-half_v_px, half_v_px, out_h, dtype=np.float32)
+    uu, vv = np.meshgrid(us, vs, indexing="xy")
+    xyz = (
+        center_xyz[None, None, :]
+        + uu[..., None] * u_xyz[None, None, :]
+        + vv[..., None] * v_xyz[None, None, :]
+    )
+    coords_zyx = np.stack([xyz[..., 2], xyz[..., 1], xyz[..., 0]], axis=0)
+    sl = ndi.map_coordinates(vol_zyx, coords_zyx, order=1, mode="nearest")
+    return sl.astype(np.float32)
+
+
+def trace_fiber_crosscorr(
+    vol_zyx: np.ndarray,
+    start_xyz: np.ndarray,
+    end_xyz: np.ndarray,
+    radius_px: float,
+    merge_step: int,
+    curve_points: int,
+    curvature: float,
+    margin_ratio: float,
+    guide_weight: float,
+    cc_upsample: int,
+) -> np.ndarray:
+    if phase_cross_correlation is None:
+        raise ImportError("phase cross correlation needs scikit-image: pip install scikit-image")
+
+    start_xyz = np.asarray(start_xyz, dtype=np.float32)
+    end_xyz = np.asarray(end_xyz, dtype=np.float32)
+    direction = end_xyz - start_xyz
+    total_len = float(np.linalg.norm(direction))
+    if total_len < 1e-4:
+        return np.vstack([start_xyz, end_xyz]).astype(np.float32)
+
+    # --step 改为“切片合并半窗”参数。
+    advance_px = merge_step + 1
+    n_steps = max(3, int(np.ceil(total_len / advance_px)))
+    merge_step = max(0, int(merge_step))
+
+    # 取消椭圆与掩膜，按正圆设置切片窗口大小。
+    circle_radius = max(1.0, float(radius_px))
+    margin = max(1.0, float(radius_px) * float(margin_ratio))
+    half_u = circle_radius + margin
+    half_v = circle_radius + margin
+
+    out_w = int(np.ceil(2 * half_u)) + 1
+    out_h = int(np.ceil(2 * half_v)) + 1
+
+    u, v, n = make_frame(direction)
+    centers = [start_xyz.copy()]
+    center = start_xyz.copy()
+
+    prev_slice_acc = np.zeros((out_h, out_w), dtype=np.float32)
+    for k in range(-merge_step, merge_step + 1):
+        p = center + float(k) * n
+        prev_slice_acc += sample_plane_slice(vol_zyx, p, u, v, half_u, half_v, out_w, out_h)
+    prev_slice = prev_slice_acc / float(2 * merge_step + 1)
+
+    for i in range(1, n_steps):
+        t = i / float(n_steps)
+        guide = start_xyz + t * (end_xyz - start_xyz)
+
+        pred = center + n * advance_px
+        pred = (1.0 - guide_weight) * pred + guide_weight * guide
+        if not _xyz_inside(vol_zyx.shape, pred):
+            pred = np.clip(pred, [0, 0, 0], [vol_zyx.shape[2] - 1, vol_zyx.shape[1] - 1, vol_zyx.shape[0] - 1])
+
+        cur_slice_acc = np.zeros((out_h, out_w), dtype=np.float32)
+        for k in range(-merge_step, merge_step + 1):
+            p = pred + float(k) * n
+            cur_slice_acc += sample_plane_slice(vol_zyx, p, u, v, half_u, half_v, out_w, out_h)
+        cur_slice = cur_slice_acc / float(2 * merge_step + 1)
+
+        shift, error, _ = phase_cross_correlation(prev_slice, cur_slice, upsample_factor=max(1, int(cc_upsample)))
+        shift_row, shift_col = float(shift[0]), float(shift[1])
+
+        # 将切片平移量映射回 3D：col 对应 u，row 对应 v；取负号用于修正预测中心。
+        corr_xyz = (-shift_col) * u + (-shift_row) * v
+        max_corr = max(1.0, radius_px * 0.8)
+        corr_norm = float(np.linalg.norm(corr_xyz))
+        if corr_norm > max_corr:
+            corr_xyz *= (max_corr / corr_norm)
+
+        # 相关性变差时降低位移校正幅度，减少噪声驱动的抖动。
+        if error > 0.7:
+            corr_xyz *= 0.20
+        elif error > 0.5:
+            corr_xyz *= 0.45
+
+        next_center = pred + corr_xyz
+        # 只保留较弱的直线引导，避免把曲线强行拉直。
+        blend = guide_weight * (1.0 if error <= 0.5 else 1.5)
+        blend = float(np.clip(blend, 0.0, 0.35))
+        next_center = (1.0 - blend) * next_center + blend * guide
+        next_center = np.clip(next_center, [0, 0, 0], [vol_zyx.shape[2] - 1, vol_zyx.shape[1] - 1, vol_zyx.shape[0] - 1])
+
+        centers.append(next_center.astype(np.float32))
+        new_dir = _normalize(next_center - center + 0.25 * (end_xyz - start_xyz) / n_steps)
+        u, v, n = update_frame(u, v, new_dir)
+
+        center = next_center
+        prev_slice_acc = np.zeros((out_h, out_w), dtype=np.float32)
+        for k in range(-merge_step, merge_step + 1):
+            p = center + float(k) * n
+            prev_slice_acc += sample_plane_slice(vol_zyx, p, u, v, half_u, half_v, out_w, out_h)
+        prev_slice = prev_slice_acc / float(2 * merge_step + 1)
+
+    centers.append(end_xyz.copy())
+    pts = np.asarray(centers, dtype=np.float32)
+    return smooth_curve(pts, start_xyz, end_xyz, curve_points=curve_points, curvature=curvature)
+
+
+def smooth_curve(points_xyz: np.ndarray, start_xyz: np.ndarray, end_xyz: np.ndarray, curve_points: int, curvature: float) -> np.ndarray:
+    points_xyz = np.asarray(points_xyz, dtype=np.float32)
+    curve_points = max(2, int(curve_points))
+    curvature = float(np.clip(curvature, 0.0, 1.0))
+
+    if len(points_xyz) < 4:
+        t = np.linspace(0.0, 1.0, curve_points, dtype=np.float32)
+        curve = start_xyz[None, :] * (1.0 - t[:, None]) + end_xyz[None, :] * t[:, None]
+        curve[0], curve[-1] = start_xyz, end_xyz
+        return curve.astype(np.float32)
+
+    d = np.linalg.norm(np.diff(points_xyz, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(d)])
+    if s[-1] < 1e-6:
+        t = np.linspace(0.0, 1.0, curve_points, dtype=np.float32)
+        curve = start_xyz[None, :] * (1.0 - t[:, None]) + end_xyz[None, :] * t[:, None]
+        curve[0], curve[-1] = start_xyz, end_xyz
+        return curve.astype(np.float32)
+    u = s / s[-1]
+
+    smooth_factor = (1.0 - curvature) * len(points_xyz) * 0.75
+    try:
+        tck, _ = splprep([points_xyz[:, 0], points_xyz[:, 1], points_xyz[:, 2]], u=u, k=min(3, len(points_xyz) - 1), s=smooth_factor)
+        uq = np.linspace(0.0, 1.0, curve_points, dtype=np.float32)
+        x, y, z = splev(uq, tck)
+        curve = np.vstack([x, y, z]).T.astype(np.float32)
+    except Exception:
+        uq = np.linspace(0.0, 1.0, curve_points, dtype=np.float32)
+        curve = np.empty((curve_points, 3), dtype=np.float32)
+        for i in range(3):
+            curve[:, i] = np.interp(uq, u, points_xyz[:, i])
+
+    curve[0], curve[-1] = start_xyz, end_xyz
+    return curve.astype(np.float32)
+
+
+def resample_curve_by_spacing(curve_xyz: np.ndarray, spacing_px: float) -> np.ndarray:
+    curve_xyz = np.asarray(curve_xyz, dtype=np.float32)
+    if len(curve_xyz) <= 1:
+        return curve_xyz.copy()
+    spacing_px = max(float(spacing_px), 1e-3)
+    seg = np.linalg.norm(np.diff(curve_xyz, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    total = float(s[-1])
+    if total <= spacing_px:
+        return np.vstack([curve_xyz[0], curve_xyz[-1]]).astype(np.float32)
+    q = np.arange(0.0, total + 0.5 * spacing_px, spacing_px, dtype=np.float32)
+    q[-1] = total
+    out = np.empty((len(q), 3), dtype=np.float32)
+    for i in range(3):
+        out[:, i] = np.interp(q, s, curve_xyz[:, i])
+    return out
+
+
+def interpolate_angles(t: np.ndarray, start_ang: np.ndarray, end_ang: np.ndarray) -> np.ndarray:
+    return start_ang + t[:, None] * (end_ang - start_ang)
+
+
+def _curve_to_der_points(curve: np.ndarray) -> np.ndarray:
+    n = len(curve)
+    tangents = np.zeros_like(curve)
+    if n == 1:
+        tangents[0] = 1.0
+        return tangents.T
+    tangents[0] = curve[1] - curve[0]
+    tangents[-1] = curve[-1] - curve[-2]
+    if n > 2:
+        tangents[1:-1] = 0.5 * (curve[2:] - curve[:-2])
+    return tangents.T
+
+
+def write_axm(path: Path, curve_xyz_px: np.ndarray, voxel_size: float) -> Path:
+    path = Path(path).with_suffix(".axm")
+    curve_a = np.asarray(curve_xyz_px, dtype=np.float32) * float(voxel_size)
+    if len(curve_a) < 2:
+        curve_a = np.vstack([curve_a[0], curve_a[0]])
+    with open(path, "wb") as f:
+        np.savez(
+            f,
+            model_type="CurvedLine",
+            particle_pos=curve_a,
+            degree=3,
+            smooth=0.0,
+            resolution=int(len(curve_a)),
+            points=curve_a.T,
+            der_points=_curve_to_der_points(curve_a),
+        )
+    return path
+
+
+def write_star(out_path: Path, coords: np.ndarray, angles: np.ndarray, origins: Optional[np.ndarray] = None) -> None:
+    if starfile is None:
+        raise ImportError("please install starfile: pip install starfile")
+    import pandas as pd
+
+    if origins is None:
+        origins = np.zeros((len(coords), 3), dtype=np.float32)
+    df = pd.DataFrame(
+        {
+            "rlnCoordinateX": coords[:, 0],
+            "rlnCoordinateY": coords[:, 1],
+            "rlnCoordinateZ": coords[:, 2],
+            "rlnOriginX": origins[:, 0],
+            "rlnOriginY": origins[:, 1],
+            "rlnOriginZ": origins[:, 2],
+            "rlnAngleRot": angles[:, 0],
+            "rlnAngleTilt": angles[:, 1],
+            "rlnAnglePsi": angles[:, 2],
+        }
+    )
+    starfile.write({"data_0": df}, out_path, overwrite=True)
+
+
+_worker_vol: Optional[np.ndarray] = None
+_worker_shm = None
+_worker_fibers: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = None
+_worker_track_kw: Dict[str, object] = {}
+
+
+def _worker_cleanup() -> None:
+    global _worker_shm
+    if _worker_shm is not None:
+        try:
+            _worker_shm.close()
+        except Exception:
+            pass
+        _worker_shm = None
+
+
+def _init_worker(shm_name: str, shape: Tuple[int, int, int], dtype_str: str, fibers: List, track_kw: Dict[str, object]) -> None:
+    global _worker_vol, _worker_shm, _worker_fibers, _worker_track_kw
+    _worker_shm = shared_memory.SharedMemory(name=shm_name)
+    _worker_vol = np.ndarray(shape, dtype=np.dtype(dtype_str), buffer=_worker_shm.buf)
+    _worker_fibers = fibers
+    _worker_track_kw = track_kw
+    atexit.register(_worker_cleanup)
+
+
+def _trace_worker(idx: int) -> Tuple[int, np.ndarray, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    # worker 仅接收索引，体积通过共享内存读取，避免重复拷贝大数组。
+    s, e, a0, a1 = _worker_fibers[idx]
+    curve = trace_fiber_crosscorr(_worker_vol, s, e, **_worker_track_kw)
+    return idx, curve.astype(np.float32), (s, e, a0, a1)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Trace fibers in .rec tomogram by 2D slice cross-correlation and export .axm/.star.")
+    parser.add_argument("--star", required=True, help="fiber start/end .star path")
+    parser.add_argument("--rec", required=True, help="input .rec tomogram path")
+    parser.add_argument("--voxel-size", required=True, type=float, help="voxel size in Angstrom")
+
+    parser.add_argument("--radius", type=float, default=250.0, help="fiber radius in Angstrom")
+    parser.add_argument("--spacing", type=float, default=40.0, help="particle spacing along curve in Angstrom")
+    parser.add_argument("--step", type=int, default=2, help="merge +/-step neighboring slices (2*step+1 total) before CC, default 2")
+    parser.add_argument("--curve-points", type=int, default=80, help="curve sample points per fiber")
+    parser.add_argument("--curvature", type=float, default=0.25, help="curve smoothing control [0,1], higher follows data more")
+
+    parser.add_argument("--slice-margin-ratio", type=float, default=0.75, help="extra sampling margin in radius units (default 0.75)")
+    parser.add_argument("--guide-weight", type=float, default=0.05, help="linear start->end guide weight during tracking (default 0.05)")
+    parser.add_argument("--cc-upsample", type=int, default=10, help="phase cross-correlation upsample factor")
+
+    parser.add_argument("--gaussian-sigma", type=float, default=2.0, help="3D gaussian sigma for enhancement (default 2.0)")
+    parser.add_argument("--closing-size", type=int, default=3, help="3D grey-closing kernel size, >1 improves continuity (default 3)")
+
+    parser.add_argument("--fiber-index", default=None, help="fiber indices: e.g. 0,2,5 or 0-3")
+    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4)), help="parallel workers")
+    parser.add_argument("--debug", action="store_true", help="save intermediate MRC files in rec folder")
+    args = parser.parse_args()
+
+    if args.voxel_size <= 0:
+        print("error: --voxel-size must be > 0", file=sys.stderr)
+        sys.exit(1)
+    if args.radius <= 0:
+        print("error: --radius must be > 0", file=sys.stderr)
+        sys.exit(1)
+
+    star_path = Path(args.star).resolve()
+    rec_path = Path(args.rec).resolve()
+    if not star_path.exists():
+        print(f"error: star file not found: {star_path}", file=sys.stderr)
+        sys.exit(1)
+    if not rec_path.exists():
+        print(f"error: rec file not found: {rec_path}", file=sys.stderr)
+        sys.exit(1)
+
+    fibers, has_orphan = read_star_fibers(star_path)
+    if has_orphan:
+        print("warning: star row count is odd, last unmatched start point is ignored.", file=sys.stderr)
+    if not fibers:
+        print("error: no valid start/end fiber pairs found.", file=sys.stderr)
+        sys.exit(1)
+
+    selected = parse_fiber_index_list(args.fiber_index, len(fibers))
+    if not selected:
+        print("error: no fiber selected.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"loading volume: {rec_path}")
+    vol = load_volume(rec_path)
+    print(f"volume shape (z,y,x): {vol.shape}")
+
+    print("enhancing volume ...")
+    voxel = float(args.voxel_size)
+    radius_px = float(args.radius) / voxel
+    spacing_px = float(args.spacing) / voxel
+    rec_dir = rec_path.parent
+    debug_mrc_prefix = rec_dir / rec_path.stem if args.debug else None
+    vol_enh = enhance_volume(
+        vol=vol,
+        voxel_size=voxel,
+        gaussian_sigma=float(args.gaussian_sigma),
+        closing_size=int(args.closing_size),
+        debug_mrc_prefix=debug_mrc_prefix,
+    )
+
+    track_kw = dict(
+        radius_px=radius_px,
+        merge_step=int(args.step),
+        curve_points=int(args.curve_points),
+        curvature=float(args.curvature),
+        margin_ratio=float(args.slice_margin_ratio),
+        guide_weight=float(args.guide_weight),
+        cc_upsample=int(args.cc_upsample),
+    )
+
+    n_workers = max(1, min(int(args.workers), len(selected)))
+    results: Dict[int, Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = {}
+
+    # 将增强后体积放入共享内存，子进程只读访问。
+    shm = shared_memory.SharedMemory(create=True, size=vol_enh.nbytes)
+    try:
+        shm_arr = np.ndarray(vol_enh.shape, dtype=vol_enh.dtype, buffer=shm.buf)
+        shm_arr[:] = vol_enh[:]
+        del shm_arr
+
+        if n_workers > 1:
+            print(f"tracing fibers in parallel, workers={n_workers}")
+            with multiprocessing.Pool(
+                processes=n_workers,
+                initializer=_init_worker,
+                initargs=(shm.name, vol_enh.shape, str(vol_enh.dtype), fibers, track_kw),
+            ) as pool:
+                for idx, curve, meta in pool.imap_unordered(_trace_worker, selected):
+                    results[idx] = (curve, meta)
+                    print(f"  fiber {idx}: {len(curve)} curve points")
+        else:
+            print("tracing fibers in single process")
+            _init_worker(shm.name, vol_enh.shape, str(vol_enh.dtype), fibers, track_kw)
+            for idx in selected:
+                ridx, curve, meta = _trace_worker(idx)
+                results[ridx] = (curve, meta)
+                print(f"  fiber {ridx}: {len(curve)} curve points")
+            _worker_cleanup()
+    finally:
+        shm.close()
+        shm.unlink()
+
+    # 输出每条纤维的可视化曲线（ArtiaX .axm）
+    axm_paths = []
+    for idx in selected:
+        curve, _ = results[idx]
+        axm_path = rec_dir / f"{rec_path.stem}_fiber{idx}.axm"
+        write_axm(axm_path, curve, voxel_size=voxel)
+        axm_paths.append(axm_path)
+    print(f"saved {len(axm_paths)} AXM files in {rec_dir}")
+
+    # 按 spacing 沿曲线重采样并写颗粒 STAR
+    out_star = rec_dir / f"{rec_path.stem}_particles.star"
+    all_coords = []
+    all_angles = []
+    for idx in selected:
+        curve, (_, _, a0, a1) = results[idx]
+        pts = resample_curve_by_spacing(curve, spacing_px=spacing_px)
+        if len(pts) == 1:
+            t = np.array([0.0], dtype=np.float32)
+        else:
+            t = np.linspace(0.0, 1.0, len(pts), dtype=np.float32)
+        ang = interpolate_angles(t, a0, a1).astype(np.float32)
+        all_coords.append(pts)
+        all_angles.append(ang)
+
+    coords = np.vstack(all_coords).astype(np.float32)
+    angles = np.vstack(all_angles).astype(np.float32)
+    write_star(out_star, coords, angles)
+    print(f"STAR saved: {out_star}, total particles: {len(coords)}")
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    main()

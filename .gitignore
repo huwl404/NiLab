@@ -1,4 +1,5 @@
 .venv/
+.history/
 __pycache__/
 test/
 data/
