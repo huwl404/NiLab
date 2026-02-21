@@ -300,23 +300,30 @@ def trace_fiber_crosscorr(
         # 前后点都使用“法向多层平均切片”做 cc。
         prev_slice = sample_axis_slice_merged(vol_zyx, center, plane, normal_axis, half, out_size, merge_step)
         cur_slice = sample_axis_slice_merged(vol_zyx, pred, plane, normal_axis, half, out_size, merge_step)
-        if debug_mrc_prefix is not None:
-            print(pred)
-            # save_mrc(f"{debug_mrc_prefix}_{i}_slice.mrc", prev_slice, voxel_size=voxel_size)
 
         # 2D 子像素位移（row, col）。prev 当 reference、cur 当 moving。
-        shift, error, _ = phase_cross_correlation(prev_slice, cur_slice, upsample_factor=max(1, int(cc_upsample)))
+        # normalization=None 使 error 值有效（phase 归一化会使 CCmax²/amp≈0 导致 error 恒≈1）
+        # Which form of normalization is better is application-dependent. For example, 
+        # the phase correlation method works well in registering images under different illumination, 
+        # but is not very robust to noise. In a high noise scenario, the unnormalized method may be preferable.
+        # Shift vector (in pixels) required to register moving_image with reference_image.
+        # https://scikit-image.org/docs/0.25.x/api/skimage.registration.html
+        shift, error, _ = phase_cross_correlation(prev_slice, cur_slice, upsample_factor=max(1, int(cc_upsample)), normalization=None)
         # 将 2D shift 映射回 xyz（只作用于切面内两个横向轴）。
+        # sample_axis_slice 输出约定：
+        #   xy: row=Y, col=X  → shift[0]=Y, shift[1]=X
+        #   xz: row=Z, col=X  → shift[0]=Z, shift[1]=X
+        #   yz: row=Z, col=Y  → shift[0]=Z, shift[1]=Y
         corr_xyz = np.zeros(3, dtype=np.float32)
         if plane == "xy":
-            corr_xyz[0] = -shift[0]
-            corr_xyz[1] = -shift[1]
+            corr_xyz[0] = shift[1]   # X = col shift
+            corr_xyz[1] = shift[0]   # Y = row shift
         elif plane == "xz":
-            corr_xyz[0] = -shift[0]
-            corr_xyz[2] = shift[1]
+            corr_xyz[0] = shift[1]   # X = col shift
+            corr_xyz[2] = shift[0]   # Z = row shift
         else:  # yz
-            corr_xyz[1] = -shift[0]
-            corr_xyz[2] = -shift[1]
+            corr_xyz[1] = shift[1]   # Y = col shift
+            corr_xyz[2] = shift[0]   # Z = row shift
 
         max_corr = max(1.0, radius_px * 0.8)  
         corr_norm = float(np.linalg.norm(corr_xyz))
@@ -327,8 +334,12 @@ def trace_fiber_crosscorr(
             corr_xyz *= 0.20
         elif error > 0.5:
             corr_xyz *= 0.50
+        
+        if debug_mrc_prefix is not None:
+            print(f"shift: {shift}, error: {error:2f}, corr_xyz: {corr_xyz}")
+            save_mrc(f"{debug_mrc_prefix}_{i}_slice.mrc", prev_slice, voxel_size=voxel_size)
 
-        next_center = pred + corr_xyz
+        next_center = pred + corr_xyz  # pred 主轴已在 normal_axis 方向上前进 axis_step 像素 line 296
         # 轴向保持严格步进；guide 仅作用在切面内，避免横向漂移。
         blend = float(np.clip(guide_weight, 0.0, 0.35))
         if plane == "xy":
@@ -337,12 +348,12 @@ def trace_fiber_crosscorr(
             next_center[2] = pred[2]
         elif plane == "xz":
             next_center[0] = (1.0 - blend) * next_center[0] + blend * guide[0]
-            next_center[2] = (1.0 - blend) * next_center[2] + blend * guide[2]
             next_center[1] = pred[1]
+            next_center[2] = (1.0 - blend) * next_center[2] + blend * guide[2]
         else:  # yz
+            next_center[0] = pred[0]
             next_center[1] = (1.0 - blend) * next_center[1] + blend * guide[1]
             next_center[2] = (1.0 - blend) * next_center[2] + blend * guide[2]
-            next_center[0] = pred[0]
         next_center = np.clip(next_center, [0, 0, 0], [vol_zyx.shape[2] - 1, vol_zyx.shape[1] - 1, vol_zyx.shape[0] - 1])
 
         centers.append(next_center.astype(np.float32))
@@ -525,12 +536,12 @@ def main() -> None:
 
     parser.add_argument("--radius", type=float, default=250.0, help="fiber radius in Angstrom")
     parser.add_argument("--spacing", type=float, default=40.0, help="particle spacing along curve in Angstrom")
-    parser.add_argument("--step", type=int, default=2, help="merge +/-step neighboring slices (2*step+1 total) before CC, default 2")
+    parser.add_argument("--step", type=int, default=1, help="merge +/-step neighboring slices (2*step+1 total) before CC, default 1")
 
     parser.add_argument("--curve-points", type=int, default=80, help="curve sample points per fiber")
     parser.add_argument("--curvature", type=float, default=0.25, help="curve smoothing control [0,1], higher follows data more")
-    parser.add_argument("--margin-ratio", type=float, default=0.75, help="extra sampling margin in radius units (default 0.75)")
-    parser.add_argument("--guide-weight", type=float, default=0.01, help="linear start->end guide weight during tracking (default 0.01, [0.0, 0.35])")
+    parser.add_argument("--margin-ratio", type=float, default=1.0, help="extra sampling margin in radius units (default 1.0)")
+    parser.add_argument("--guide-weight", type=float, default=0.05, help="linear start->end guide weight during tracking (default 0.05, [0.0, 0.35])")
     parser.add_argument("--cc-upsample", type=int, default=10, help="phase cross-correlation upsample factor (default 10)")
     parser.add_argument("--gaussian-sigma", type=float, default=2.0, help="3D gaussian sigma for enhancement (default 2.0)")
     parser.add_argument("--closing-size", type=int, default=3, help="3D grey-closing kernel size, >1 improves continuity (default 3)")
