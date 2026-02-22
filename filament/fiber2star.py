@@ -131,23 +131,35 @@ def enhance_volume(
     voxel_size: float,
     gaussian_sigma: float,
     closing_size: int,
+    no_invert: bool,
     debug_mrc_prefix: Optional[str],
 ) -> np.ndarray:
     # 互相关前建议做轻量增强；低对比/断续纤维直接做互相关容易退化成直线。
     x = normalize_volume(vol)
     if debug_mrc_prefix is not None:
         save_mrc(f"{debug_mrc_prefix}_1_normalize.mrc", x, voxel_size=voxel_size)
+    
+    # Invert so that the filament becomes bright (high values).
+    # Required when the filament appears dark in the tomogram:
+    #   - Makes grey_closing correct (closes gaps in bright filament instead of filling it in).
+    #   - Makes the unnormalized CC peak more prominent (bright signal > noisy background).
+    if not no_invert:
+        x = 1.0 - x
+        if debug_mrc_prefix is not None:
+            save_mrc(f"{debug_mrc_prefix}_2_invert.mrc", x, voxel_size=voxel_size)
 
     if gaussian_sigma > 0:
         x = ndi.gaussian_filter(x, sigma=gaussian_sigma).astype(np.float32)
         if debug_mrc_prefix is not None:
-            save_mrc(f"{debug_mrc_prefix}_2_gaussian.mrc", x, voxel_size=voxel_size)
+            save_mrc(f"{debug_mrc_prefix}_3_gaussian.mrc", x, voxel_size=voxel_size)
 
     if closing_size > 1:
         s = int(closing_size)
+        # ndi.grey_closing = 膨胀 + 腐蚀，作用是填充暗区域。对于黑色纤维（暗结构在亮背景中），它会把纤维信号填平，直接破坏用于追踪的密度特征。
+        # 应该用 grey_opening（腐蚀+膨胀，保留暗结构），或在处理前先反相。
         x = ndi.grey_closing(x, size=(s, s, s)).astype(np.float32)
         if debug_mrc_prefix is not None:
-            save_mrc(f"{debug_mrc_prefix}_3_closing.mrc", x, voxel_size=voxel_size)
+            save_mrc(f"{debug_mrc_prefix}_4_closing.mrc", x, voxel_size=voxel_size)
 
     return x
 
@@ -193,9 +205,9 @@ def sample_axis_slice(vol_zyx: np.ndarray, center_xyz: np.ndarray, plane: str, h
     """
     在体积中以 center 为中心，采样一张轴对齐 2D 切片。
     输出约定（用于 cc 的 row/col）：
-    - xy: row=y, col=x
-    - xz: row=z, col=x
-    - yz: row=z, col=y
+    - xy: col=x, row=y
+    - xz: col=x, row=z
+    - yz: col=y, row=z
     """
     t = np.linspace(-half, half, out_size, dtype=np.float32)  # 生成一维坐标轴：-half, half, out_size 个点
     xx, yy = np.meshgrid(t, t, indexing="xy")  # 生成二维网格： out_size x out_size 的矩阵， xx 为列偏移网格，yy 为行偏移网格
@@ -204,18 +216,18 @@ def sample_axis_slice(vol_zyx: np.ndarray, center_xyz: np.ndarray, plane: str, h
     if plane == "xy":  # 根据 plane 选择采样平面，告诉采样坐标
         x = cx + xx
         y = cy + yy
-        z = np.full_like(x, cz, dtype=np.float32)
+        # 建一个和 xx 形状完全一样、但所有元素都填满 cz 这个值的矩阵。
+        z = np.full_like(xx, cz)
     elif plane == "xz":
-        x = cx + xx
-        z = cz + yy
-        y = np.full_like(x, cy, dtype=np.float32)
+        x, y, z = cx + xx, np.full_like(xx, cy), cz + yy
     else:  # yz
-        y = cy + xx
-        z = cz + yy
-        x = np.full_like(y, cx, dtype=np.float32)
+        x, y, z = np.full_like(xx, cx), cy + xx, cz + yy
 
     coords_zyx = np.stack([z, y, x], axis=0)
-    sl = ndi.map_coordinates(vol_zyx, coords_zyx, order=1, mode="nearest")  # 使用一阶线性插值法对体积进行采样
+    # # 如果采样范围超出 tomogram，填充全局均值比拉伸边缘像素更不容易在 FFT 中产生伪影
+    # bg_value = float(np.mean(vol_zyx))
+    # 高阶插值可能会产生 Ringing Artifacts（振铃效应），即在噪声点周围产生虚假的阴影。
+    sl = ndi.map_coordinates(vol_zyx, coords_zyx, order=1, mode="nearest")
     return sl.astype(np.float32)
 
 
@@ -251,6 +263,7 @@ def trace_fiber_crosscorr(
     curvature: float,
     margin_ratio: float,
     guide_weight: float,
+    guide_mode: str,
     cc_upsample: int,
     debug_mrc_prefix: Optional[str],
     voxel_size: float,
@@ -276,11 +289,15 @@ def trace_fiber_crosscorr(
         return np.vstack([start_xyz, end_xyz]).astype(np.float32)
 
     merge_step = max(0, int(merge_step))
-    # 严格轴向步进：先固定主轴，再只沿该轴每次前进 merge_step + 1 像素。
+    # 严格轴向步进：先固定主轴，再只沿该轴每次前进 2 * merge_step + 1 像素。
     plane, normal_axis, axis_sign = _pick_axis_plane(direction)
-    axis_step = axis_sign * (merge_step + 1)
-    axis_span = abs(float(direction[normal_axis]))
+    # 如果两个比较的slice重叠，极其相似，噪声主导位移，误差一步步累积，严重时会导致轨迹偏离终点
+    axis_step = axis_sign * (2 * merge_step + 1)
+    axis_span = float(direction[normal_axis])
     n_steps = max(2, int(axis_span / axis_step))
+
+    if debug_mrc_prefix is not None:
+        print(f"plane: {plane}, normal_axis: {normal_axis}, axis_sign: {axis_sign}, axis_step: {axis_step}, axis_span: {axis_span}, n_steps: {n_steps}")
 
     # 单一 half：正圆窗口半径 + 额外 margin。
     half = max(1.0, radius_px) + max(1.0, radius_px * margin_ratio)
@@ -289,9 +306,6 @@ def trace_fiber_crosscorr(
     center = start_xyz.copy()
 
     for i in range(1, n_steps):
-        t = i / float(n_steps)
-        guide = start_xyz + t * (end_xyz - start_xyz) 
-
         pred = center.copy()
         pred[normal_axis] += axis_step  # e.g.: z-axis: pred[2] += axis_step
         if not _xyz_inside(vol_zyx.shape, pred):
@@ -307,57 +321,77 @@ def trace_fiber_crosscorr(
         # the phase correlation method works well in registering images under different illumination, 
         # but is not very robust to noise. In a high noise scenario, the unnormalized method may be preferable.
         # Shift vector (in pixels) required to register moving_image with reference_image.
-        # https://scikit-image.org/docs/0.25.x/api/skimage.registration.html
+        # https://scikit-image.org/docs/0.25.x/api/skimage.registration.html, see backup/test_pcc.py
         shift, error, _ = phase_cross_correlation(prev_slice, cur_slice, upsample_factor=max(1, int(cc_upsample)), normalization=None)
-        # 将 2D shift 映射回 xyz（只作用于切面内两个横向轴）。
+        # skimage 的 shift 返回顺序是 [行位移, 列位移]，对应到切片：
         # sample_axis_slice 输出约定：
-        #   xy: row=Y, col=X  → shift[0]=Y, shift[1]=X
-        #   xz: row=Z, col=X  → shift[0]=Z, shift[1]=X
-        #   yz: row=Z, col=Y  → shift[0]=Z, shift[1]=Y
+        # - xy: col=x, row=y → shift[0]=Y, shift[1]=X
+        # - xz: col=x, row=z → shift[0]=Z, shift[1]=X
+        # - yz: col=y, row=z → shift[0]=Z, shift[1]=Y
         corr_xyz = np.zeros(3, dtype=np.float32)
+        # shift 是把下一张对齐到上一张需要移动的像素数，所以需要取反
         if plane == "xy":
-            corr_xyz[0] = shift[1]   # X = col shift
-            corr_xyz[1] = shift[0]   # Y = row shift
+            corr_xyz[0] = -shift[1]  
+            corr_xyz[1] = -shift[0] 
         elif plane == "xz":
-            corr_xyz[0] = shift[1]   # X = col shift
-            corr_xyz[2] = shift[0]   # Z = row shift
+            corr_xyz[0] = -shift[1]  
+            corr_xyz[2] = -shift[0]   
         else:  # yz
-            corr_xyz[1] = shift[1]   # Y = col shift
-            corr_xyz[2] = shift[0]   # Z = row shift
+            corr_xyz[1] = -shift[1] 
+            corr_xyz[2] = -shift[0]
 
-        max_corr = max(1.0, radius_px * 0.8)  
+        max_corr = max(1.0, radius_px * 0.5)  
         corr_norm = float(np.linalg.norm(corr_xyz))
         if corr_norm > max_corr:
             corr_xyz *= (max_corr / corr_norm)
         # 相关性变差时降低位移校正幅度，减少噪声驱动的抖动。
         if error > 0.7:
-            corr_xyz *= 0.20
+            corr_xyz *= 0.30
         elif error > 0.5:
             corr_xyz *= 0.50
-        
-        if debug_mrc_prefix is not None:
-            print(f"shift: {shift}, error: {error:2f}, corr_xyz: {corr_xyz}")
-            save_mrc(f"{debug_mrc_prefix}_{i}_slice.mrc", prev_slice, voxel_size=voxel_size)
 
-        next_center = pred + corr_xyz  # pred 主轴已在 normal_axis 方向上前进 axis_step 像素 line 296
-        # 轴向保持严格步进；guide 仅作用在切面内，避免横向漂移。
-        blend = float(np.clip(guide_weight, 0.0, 0.35))
+        next_center = pred + corr_xyz  # pred 主轴已在 normal_axis 方向上前进 axis_step 像素 line 307
+        t = i / float(n_steps)
+        if guide_mode == "momentum" and len(centers) >= 2:
+            # Extrapolate from the most recent two centers (local tangent direction).
+            prev2 = np.asarray(centers[-2], dtype=np.float32)
+            prev1 = np.asarray(centers[-1], dtype=np.float32)
+            recent = prev1 - prev2
+            n_comp = float(recent[normal_axis])  # 取 recent 在主轴方向（X）上的分量，后面用来做等比缩放的分母。
+            # 无论上一步走得快慢，guide 总是沿当前切线方向、在 X 上恰好前进一步。
+            if abs(n_comp) > 1e-6:
+                guide = prev1 + recent * (float(axis_step) / n_comp)
+            else:
+                guide = prev1.copy()
+            # 强制覆盖 guide 的主轴坐标，让它严格等于 center_x + axis_step（即 pred 的 X 坐标）。
+            guide[normal_axis] = float(center[normal_axis]) + float(axis_step)
+            # Last 25% of steps: gradually blend toward end_xyz so the curve converges.
+            end_frac = float(np.clip((t - 0.75) / 0.25, 0.0, 1.0)) # 最后 25% 的步数，以 1 的斜率逐渐向 end_xyz 收敛。
+            if end_frac > 0.0:
+                guide = guide + end_frac * (end_xyz - guide)
+                guide[normal_axis] = float(center[normal_axis]) + float(axis_step)
+        else:
+            guide = start_xyz + t * (end_xyz - start_xyz)
+
+        blend = float(np.clip(guide_weight, 0.0, 1.0))
+        cc_w, guide_w = (1.0 - blend), blend
         if plane == "xy":
-            next_center[0] = (1.0 - blend) * next_center[0] + blend * guide[0]
-            next_center[1] = (1.0 - blend) * next_center[1] + blend * guide[1]
-            next_center[2] = pred[2]
+            next_center[0] = cc_w * next_center[0] + guide_w * guide[0]
+            next_center[1] = cc_w * next_center[1] + guide_w * guide[1]
         elif plane == "xz":
-            next_center[0] = (1.0 - blend) * next_center[0] + blend * guide[0]
-            next_center[1] = pred[1]
-            next_center[2] = (1.0 - blend) * next_center[2] + blend * guide[2]
+            next_center[0] = cc_w * next_center[0] + guide_w * guide[0]
+            next_center[2] = cc_w * next_center[2] + guide_w * guide[2]
         else:  # yz
-            next_center[0] = pred[0]
-            next_center[1] = (1.0 - blend) * next_center[1] + blend * guide[1]
-            next_center[2] = (1.0 - blend) * next_center[2] + blend * guide[2]
+            next_center[1] = cc_w * next_center[1] + guide_w * guide[1]
+            next_center[2] = cc_w * next_center[2] + guide_w * guide[2]
         next_center = np.clip(next_center, [0, 0, 0], [vol_zyx.shape[2] - 1, vol_zyx.shape[1] - 1, vol_zyx.shape[0] - 1])
 
         centers.append(next_center.astype(np.float32))
         center = next_center
+
+        if debug_mrc_prefix is not None:
+            print(f"shift: {shift}, error: {error:2f}, corr_xyz: {corr_xyz}, next_center: {next_center}")
+            save_mrc(f"{debug_mrc_prefix}_{i}_slice.mrc", prev_slice, voxel_size=voxel_size)  # slices have been aligned
 
     # 末端强制回到用户给定终点，保证输出曲线精确经过 start/end。
     centers.append(end_xyz.copy())
@@ -536,14 +570,19 @@ def main() -> None:
 
     parser.add_argument("--radius", type=float, default=250.0, help="fiber radius in Angstrom")
     parser.add_argument("--spacing", type=float, default=40.0, help="particle spacing along curve in Angstrom")
-    parser.add_argument("--step", type=int, default=1, help="merge +/-step neighboring slices (2*step+1 total) before CC, default 1")
+    parser.add_argument("--step", type=int, default=1, help="merge +/-step neighboring slices (2*step+1 total) before CC (default 1, real advance step is 2*step+1)")
 
     parser.add_argument("--curve-points", type=int, default=80, help="curve sample points per fiber")
     parser.add_argument("--curvature", type=float, default=0.25, help="curve smoothing control [0,1], higher follows data more")
     parser.add_argument("--margin-ratio", type=float, default=1.0, help="extra sampling margin in radius units (default 1.0)")
-    parser.add_argument("--guide-weight", type=float, default=0.05, help="linear start->end guide weight during tracking (default 0.05, [0.0, 0.35])")
-    parser.add_argument("--cc-upsample", type=int, default=10, help="phase cross-correlation upsample factor (default 10)")
+    parser.add_argument("--guide-weight", type=float, default=0.20, help="blend weight [0,1] (default 0.20, small = CC dominant).")
+    parser.add_argument("--guide-mode", default="momentum", choices=["linear", "momentum"],
+                        help="guide strategy: 'linear' uses start->end line (good for straight fibers); "
+                             "'momentum' extrapolates from recent trajectory (default, better for curved fibers)")
+    parser.add_argument("--cc-upsample", type=int, default=1, help="phase cross-correlation upsample factor (default 1)")
+    parser.add_argument("--no-enhance", action="store_true", help="don't enhance volume (following gaussian, invert, closing)")
     parser.add_argument("--gaussian-sigma", type=float, default=2.0, help="3D gaussian sigma for enhancement (default 2.0)")
+    parser.add_argument("--no-invert", action="store_true", help="don't invert contrast after normalization (set this only if you are sure that filaments are bright in the tomogram)")
     parser.add_argument("--closing-size", type=int, default=3, help="3D grey-closing kernel size, >1 improves continuity (default 3)")
 
     parser.add_argument("--fiber-index", default=None, help="fiber indices: e.g. 0,2,5 or 0-3")
@@ -589,13 +628,16 @@ def main() -> None:
     spacing_px = float(args.spacing) / voxel
     rec_dir = rec_path.parent
     debug_mrc_prefix = rec_dir / rec_path.stem if args.debug else None
-    vol_enh = enhance_volume(
-        vol=vol,
-        voxel_size=voxel,
-        gaussian_sigma=float(args.gaussian_sigma),
-        closing_size=int(args.closing_size),
-        debug_mrc_prefix=debug_mrc_prefix,
-    )
+    vol_enh = vol
+    if not args.no_enhance:
+        vol_enh = enhance_volume(
+            vol=vol,
+            voxel_size=voxel,
+            gaussian_sigma=float(args.gaussian_sigma),
+            closing_size=int(args.closing_size),
+            no_invert=bool(args.no_invert),
+            debug_mrc_prefix=debug_mrc_prefix,
+        )
 
     # 追踪参数统一打包传入 worker，避免多进程时参数散落。
     track_kw = dict(
@@ -605,6 +647,7 @@ def main() -> None:
         curvature=float(args.curvature),
         margin_ratio=float(args.margin_ratio),
         guide_weight=float(args.guide_weight),
+        guide_mode=str(args.guide_mode),
         cc_upsample=int(args.cc_upsample),
         debug_mrc_prefix=debug_mrc_prefix,
         voxel_size=voxel,
