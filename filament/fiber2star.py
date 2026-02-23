@@ -32,6 +32,11 @@ except ImportError:
     phase_cross_correlation = None
 
 try:
+    from skimage.filters import frangi
+except ImportError:
+    frangi = None
+
+try:
     import mrcfile
 except ImportError:
     mrcfile = None
@@ -107,10 +112,10 @@ def load_volume(rec_path: Path) -> np.ndarray:
     return vol
 
 
-def save_mrc(path: Path, data: np.ndarray, voxel_size: float = 1.0) -> None:
+def save_mrc(path: str, data: np.ndarray, voxel_size: float = 1.0) -> None:
     if mrcfile is None:
         raise ImportError("please install mrcfile: pip install mrcfile")
-    with mrcfile.new(str(path), overwrite=True) as m:
+    with mrcfile.new(path, overwrite=True) as m:
         m.set_data(np.asarray(data, dtype=np.float32))
         try:
             m.voxel_size = float(voxel_size)
@@ -126,25 +131,63 @@ def normalize_volume(vol: np.ndarray, low: float = 2.0, high: float = 98.0) -> n
     return np.clip(x, 0.0, 1.0).astype(np.float32)
 
 
+def invert_volume(vol: np.ndarray) -> np.ndarray:
+    max_value = np.max(vol)
+    return max_value - vol
+
+
+def frangi_volume(vol: np.ndarray, radius_px: float, black_ridges: bool = False) -> np.ndarray:
+    """
+    3D Frangi 管状增强（Hessian 特征值）：增强管状/血管状结构，输出在管腔处较亮。
+    适用于类似两根半径约 14nm、管壁厚约 7nm 的血管紧贴在一起的目标，尺寸差异不大时用单一尺度范围即可。
+    参数:
+        vol: 输入体积 (z,y,x)，建议已归一化或已取反使管状结构为亮信号。
+        voxel_size: 体素尺寸（与 vessel_radius/vessel_thickness 同单位，如 Angstrom）。
+        vessel_radius: 目标血管半径（物理单位，默认 140 即 14nm）。
+        vessel_thickness: 目标血管厚度/直径量级（物理单位，默认 70 即 7nm），用于确定多尺度 sigma 下限。
+        black_ridges: True 检测暗管，False 检测亮管（默认）。
+    返回:
+        float32 体积，管状结构处响应较强。
+    """
+    if frangi is None:
+        raise ImportError("please install scikit-image: pip install scikit-image")
+
+    # 多尺度 sigma（体素）：从约半厚度到两倍半径，覆盖 7–28nm 量级，尺度差异不大故 4 个尺度即可
+    sigma_min = max(0.5, radius_px * 0.5)
+    sigma_max = max(sigma_min + 1.0, radius_px * 2)
+    sigmas = np.linspace(sigma_min, sigma_max, 4)
+    sigmas = np.unique(sigmas).tolist()
+    if not sigmas:
+        sigmas = [max(1.0, radius_px)]
+
+    out = frangi(vol.astype(np.float64), sigmas=sigmas, black_ridges=black_ridges, mode="reflect")
+    out = np.asarray(out, dtype=np.float32)
+    return out
+
+
 def enhance_volume(
     vol: np.ndarray,
     voxel_size: float,
+    radius_px: float,
     gaussian_sigma: float,
     closing_size: int,
+    no_norm: bool,
     no_invert: bool,
+    no_frangi: bool,
     debug_mrc_prefix: Optional[str],
 ) -> np.ndarray:
-    # 互相关前建议做轻量增强；低对比/断续纤维直接做互相关容易退化成直线。
-    x = normalize_volume(vol)
-    if debug_mrc_prefix is not None:
-        save_mrc(f"{debug_mrc_prefix}_1_normalize.mrc", x, voxel_size=voxel_size)
+    x = vol
+    if not no_norm:
+        x = normalize_volume(vol)
+        if debug_mrc_prefix is not None:
+            save_mrc(f"{debug_mrc_prefix}_1_normalize.mrc", x, voxel_size=voxel_size)
     
     # Invert so that the filament becomes bright (high values).
     # Required when the filament appears dark in the tomogram:
     #   - Makes grey_closing correct (closes gaps in bright filament instead of filling it in).
     #   - Makes the unnormalized CC peak more prominent (bright signal > noisy background).
     if not no_invert:
-        x = 1.0 - x
+        x = invert_volume(x)
         if debug_mrc_prefix is not None:
             save_mrc(f"{debug_mrc_prefix}_2_invert.mrc", x, voxel_size=voxel_size)
 
@@ -156,10 +199,14 @@ def enhance_volume(
     if closing_size > 1:
         s = int(closing_size)
         # ndi.grey_closing = 膨胀 + 腐蚀，作用是填充暗区域。对于黑色纤维（暗结构在亮背景中），它会把纤维信号填平，直接破坏用于追踪的密度特征。
-        # 应该用 grey_opening（腐蚀+膨胀，保留暗结构），或在处理前先反相。
         x = ndi.grey_closing(x, size=(s, s, s)).astype(np.float32)
         if debug_mrc_prefix is not None:
             save_mrc(f"{debug_mrc_prefix}_4_closing.mrc", x, voxel_size=voxel_size)
+    
+    if not no_frangi:
+        x = frangi_volume(x, radius_px, black_ridges=False)
+        if debug_mrc_prefix is not None:
+            save_mrc(f"{debug_mrc_prefix}_5_frangi.mrc", x, voxel_size=voxel_size)
 
     return x
 
@@ -568,22 +615,25 @@ def main() -> None:
     parser.add_argument("--rec", required=True, help="input .rec tomogram path")
     parser.add_argument("--voxel-size", required=True, type=float, help="voxel size in Angstrom")
 
-    parser.add_argument("--radius", type=float, default=250.0, help="fiber radius in Angstrom")
-    parser.add_argument("--spacing", type=float, default=40.0, help="particle spacing along curve in Angstrom")
-    parser.add_argument("--step", type=int, default=1, help="merge +/-step neighboring slices (2*step+1 total) before CC (default 1, real advance step is 2*step+1)")
+    parser.add_argument("--radius", type=float, default=140.0, help="fiber radius in Angstrom (default 140.0)")
+    parser.add_argument("--spacing", type=float, default=40.0, help="particle spacing along curve in Angstrom (default 40.0)")
+    parser.add_argument("--step", type=int, default=1, help="merge +/-step neighboring slices (2*step+1 total) before CC (default 1, real advance step is 2*1+1 = 3)")
 
-    parser.add_argument("--curve-points", type=int, default=80, help="curve sample points per fiber")
-    parser.add_argument("--curvature", type=float, default=0.25, help="curve smoothing control [0,1], higher follows data more")
-    parser.add_argument("--margin-ratio", type=float, default=1.0, help="extra sampling margin in radius units (default 1.0)")
+    parser.add_argument("--margin-ratio", type=float, default=2.0, help="extra sampling margin in radius units (default 2.0, so the slice box would be 2*(1+2)*140 = 840 angstrom)")
     parser.add_argument("--guide-weight", type=float, default=0.20, help="blend weight [0,1] (default 0.20, small = CC dominant).")
     parser.add_argument("--guide-mode", default="momentum", choices=["linear", "momentum"],
                         help="guide strategy: 'linear' uses start->end line (good for straight fibers); "
                              "'momentum' extrapolates from recent trajectory (default, better for curved fibers)")
     parser.add_argument("--cc-upsample", type=int, default=1, help="phase cross-correlation upsample factor (default 1)")
-    parser.add_argument("--no-enhance", action="store_true", help="don't enhance volume (following gaussian, invert, closing)")
+    parser.add_argument("--curve-points", type=int, default=80, help="curve sample points per fiber")
+    parser.add_argument("--curvature", type=float, default=0.25, help="curve smoothing control [0,1], higher follows data more")
+
+    parser.add_argument("--no-enhance", action="store_true", help="don't enhance volume (following normalization, inversion, gaussian, closing, frangi)")
+    parser.add_argument("--no-norm", action="store_true", help="don't apply normalization")
     parser.add_argument("--gaussian-sigma", type=float, default=2.0, help="3D gaussian sigma for enhancement (default 2.0)")
-    parser.add_argument("--no-invert", action="store_true", help="don't invert contrast after normalization (set this only if you are sure that filaments are bright in the tomogram)")
+    parser.add_argument("--no-invert", action="store_true", help="don't invert contrast (set this only if you are sure that filaments are bright in the tomogram)")
     parser.add_argument("--closing-size", type=int, default=3, help="3D grey-closing kernel size, >1 improves continuity (default 3)")
+    parser.add_argument("--no-frangi", action="store_true", help="don't use frangi for enhancement (default False)")
 
     parser.add_argument("--fiber-index", default=None, help="fiber indices: e.g. 0,2,5 or 0-3")
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4)), help="parallel workers")
@@ -633,9 +683,12 @@ def main() -> None:
         vol_enh = enhance_volume(
             vol=vol,
             voxel_size=voxel,
+            radius_px=radius_px,
             gaussian_sigma=float(args.gaussian_sigma),
             closing_size=int(args.closing_size),
+            no_norm=bool(args.no_norm),
             no_invert=bool(args.no_invert),
+            no_frangi=bool(args.no_frangi),
             debug_mrc_prefix=debug_mrc_prefix,
         )
 

@@ -432,32 +432,11 @@ def apply_rotation_to_volume(vol: np.ndarray, R: np.ndarray, origin: np.ndarray)
 # ========== 卷积前预处理（归一化 + Gaussian + Kuwahara + Bottom-hat）==========
 
 def _normalize_roi(roi: np.ndarray, percentile_low: float = 2.0, percentile_high: float = 98.0, use_std: bool = True) -> np.ndarray:
-    """
-    对 ROI 体积做稳健归一化，使不同纤维/ROI 的尺度一致，便于后续滤波与卷积。
-    percentile_low, percentile_high: 归一化前先做百分位裁剪，避免极值拉偏均值和标准差。
-        - 范围 (0, 100)。(2, 98) 较稳健；(0, 100) 不裁剪。
-    use_std: True 时做 (v - mean) / std；False 时仅减均值。
-        - 若 std 接近 0（平坦区域），会退化为仅减均值并避免除零。
-    """
-    out = np.asarray(roi, dtype=np.float32)
-    valid = np.isfinite(out)
-    if not np.any(valid):
-        return out
-
-    v = out[valid]
-    lo = np.percentile(v, percentile_low)
-    hi = np.percentile(v, percentile_high)
-    out = np.clip(out, lo, hi)
-    mean = np.mean(out[valid])
-    if use_std:
-        std = np.std(out[valid])
-        if std > 1e-12:
-            out = (out - mean) / std
-        else:
-            out = out - mean
-    else:
-        out = out - mean
-    return out.astype(np.float32)
+    lo, hi = np.percentile(roi, [percentile_low, percentile_high])
+    if hi <= lo:
+        return np.zeros_like(roi, dtype=np.float32)
+    x = (roi - lo) / (hi - lo)
+    return np.clip(x, 0.0, 1.0).astype(np.float32)
 
 
 def _gaussian_filter_3d(roi: np.ndarray, sigma: float) -> np.ndarray:
@@ -590,6 +569,7 @@ def fit_fiber_convolve(
         return np.array([start, end])
     
     if debug_mrc_prefix is not None:
+        print(f"roi shape: {roi.shape}, origin: {origin}, shp: {shp}")
         save_mrc(f"{debug_mrc_prefix}_0_roi.mrc", roi, voxel_size)
 
     # ========== 步骤 2: 坐标旋转 ==========
@@ -1150,7 +1130,7 @@ Examples:
     parser.add_argument("--curvature", type=float, default=0.1, help="curvature [0,1], 0=straightest (strong smoothing), 1=tightest (follows skeleton), default 0.1")
     parser.add_argument("--threshold", type=float, default=75.0, help="binarization percentile (0-100), default 75, higher values are stricter")
     parser.add_argument("--erode", type=int, default=1, help="erode iterations after binarization, default 1, try 2-3 for discontinuous fibers")
-    parser.add_argument("--curve-points", type=int, default=10, help="number of points per fitted curve (default 10, reduce for speed)")
+    parser.add_argument("--curve-points", type=int, default=80, help="number of points per fitted curve (default 80, reduce for speed)")
     
     # ===== 输出模式（二选一）=====
     parser.add_argument("--spacing", type=float, default=40, help="equidistant sampling step (Å), default 40 (equidistant mode)")
