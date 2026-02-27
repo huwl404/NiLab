@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
+使用.venv环境运行, python 3.9
 纤维起止点 + .rec 体积 → 卷积/二值化/可调曲率拟合 → 颗粒 STAR 或 MOD 过滤转 STAR
 
 本脚本实现了基于体积卷积的纤维自动拟合算法，主要功能：

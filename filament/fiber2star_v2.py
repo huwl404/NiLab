@@ -1,15 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
+使用.venv环境运行, python 3.9
 基于二维切片互相关的纤维追踪：
 fiber start/end .star + .rec tomogram -> fiber tracing -> export .axm + particles .star
 
 设计要点：
-1) 不裁剪 ROI，直接在原始体积上进行切片采样与互相关追踪。
+1) 启用体积增强时，先按每条纤维起止点裁剪 ROI，再在 ROI 上做 enhance_volume（含 frangi），
+   避免在原始全图上的耗时预处理；裁剪与增强在 worker 内完成，支持多进程。
 2) 纤维截面按正圆近似，采样窗口由 radius + margin 控制。
-3) 提供体积增强（对比度与连续性）以应对断续纤维。
-4) --debug 打开时，将中间 mrc 输出到输入 rec 同目录。
-5) 支持按纤维多进程并行追踪。
+3) 体积增强包括归一化、取反、高斯、closing、frangi 等，以应对断续纤维。
+4) --debug 打开时，将中间 mrc 输出到输入 rec 同目录（多进程时按纤维分文件）。
+5) 支持按纤维多进程并行（每条纤维：裁剪 ROI → 增强 → 追踪）。
 """
 from __future__ import annotations
 
@@ -165,6 +167,45 @@ def frangi_volume(vol: np.ndarray, radius_px: float, black_ridges: bool = False)
     return out
 
 
+def crop_roi_around_fiber(vol_zyx: np.ndarray, start_xyz: np.ndarray, end_xyz: np.ndarray, crop_margin_ratio: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    根据纤维起止点裁剪 ROI，使 enhance_volume（含 frangi）仅在局部进行，降低耗时。
+    以纤维在三轴上的最小跨度（高度差）为单位，在周围各保留 crop_margin_ratio 倍的区域。
+    坐标约定：start_xyz/end_xyz 为 (x,y,z)，vol 为 (z,y,x)。
+    返回:
+        roi_zyx: 裁剪后的体积 vol[z0:z1, y0:y1, x0:x1]
+        origin_xyz: (x0, y0, z0)，用于将 ROI 内坐标转回全图：curve_full = curve_roi + origin_xyz
+    """
+    start_xyz = np.asarray(start_xyz, dtype=np.float32)
+    end_xyz = np.asarray(end_xyz, dtype=np.float32)
+    shape_zyx = vol_zyx.shape
+    zmax, ymax, xmax = shape_zyx
+
+    span_x = abs(end_xyz[0] - start_xyz[0])
+    span_y = abs(end_xyz[1] - start_xyz[1])
+    span_z = abs(end_xyz[2] - start_xyz[2])
+    min_span = float(min(span_x, span_y, span_z))
+    margin = max(1.0, crop_margin_ratio * min_span)
+
+    x_min = int(np.floor(min(start_xyz[0], end_xyz[0]) - margin))
+    x_max = int(np.ceil(max(start_xyz[0], end_xyz[0]) + margin)) + 1
+    y_min = int(np.floor(min(start_xyz[1], end_xyz[1]) - margin))
+    y_max = int(np.ceil(max(start_xyz[1], end_xyz[1]) + margin)) + 1
+    z_min = int(np.floor(min(start_xyz[2], end_xyz[2]) - margin))
+    z_max = int(np.ceil(max(start_xyz[2], end_xyz[2]) + margin)) + 1
+
+    x0 = max(0, x_min)
+    x1 = min(xmax, x_max)
+    y0 = max(0, y_min)
+    y1 = min(ymax, y_max)
+    z0 = max(0, z_min)
+    z1 = min(zmax, z_max)
+
+    roi_zyx = np.asarray(vol_zyx[z0:z1, y0:y1, x0:x1], dtype=np.float32, order="C")
+    origin_xyz = np.array([float(x0), float(y0), float(z0)], dtype=np.float32)
+    return roi_zyx, origin_xyz
+
+
 def enhance_volume(
     vol: np.ndarray,
     voxel_size: float,
@@ -308,7 +349,7 @@ def trace_fiber_crosscorr(
     merge_step: int,
     curve_points: int,
     curvature: float,
-    margin_ratio: float,
+    slice_margin_ratio: float,
     guide_weight: float,
     guide_mode: str,
     cc_upsample: int,
@@ -347,7 +388,7 @@ def trace_fiber_crosscorr(
         print(f"plane: {plane}, normal_axis: {normal_axis}, axis_sign: {axis_sign}, axis_step: {axis_step}, axis_span: {axis_span}, n_steps: {n_steps}")
 
     # 单一 half：正圆窗口半径 + 额外 margin。
-    half = max(1.0, radius_px) + max(1.0, radius_px * margin_ratio)
+    half = max(1.0, radius_px) + max(1.0, radius_px * slice_margin_ratio)
     out_size = int(np.ceil(2 * half)) + 1
     centers = [start_xyz.copy()]
     center = start_xyz.copy()
@@ -581,6 +622,7 @@ _worker_vol: Optional[np.ndarray] = None
 _worker_shm = None
 _worker_fibers: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = None
 _worker_track_kw: Dict[str, object] = {}
+_worker_enhance_kw: Optional[Dict[str, object]] = None
 
 
 def _worker_cleanup() -> None:
@@ -593,20 +635,42 @@ def _worker_cleanup() -> None:
         _worker_shm = None
 
 
-def _init_worker(shm_name: str, shape: Tuple[int, int, int], dtype_str: str, fibers: List, track_kw: Dict[str, object]) -> None:
-    global _worker_vol, _worker_shm, _worker_fibers, _worker_track_kw
+def _init_worker(shm_name: str, shape: Tuple[int, int, int], dtype_str: str, fibers: List, track_kw: Dict[str, object], enhance_kw: Optional[Dict[str, object]]) -> None:
+    global _worker_vol, _worker_shm, _worker_fibers, _worker_track_kw, _worker_enhance_kw
     _worker_shm = shared_memory.SharedMemory(name=shm_name)
     _worker_vol = np.ndarray(shape, dtype=np.dtype(dtype_str), buffer=_worker_shm.buf)
     _worker_fibers = fibers
     _worker_track_kw = track_kw
+    _worker_enhance_kw = enhance_kw
     atexit.register(_worker_cleanup)
 
 
 def _trace_worker(idx: int) -> Tuple[int, np.ndarray, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
-    # worker 仅接收索引，体积通过共享内存读取，避免重复拷贝大数组。
+    # worker 仅接收索引，体积通过共享内存读取。若启用了 ROI 增强，则先裁剪 ROI → enhance → 在 ROI 内追踪，再转回全图坐标。
     s, e, a0, a1 = _worker_fibers[idx]
-    curve = trace_fiber_crosscorr(_worker_vol, s, e, **_worker_track_kw)
-    return idx, curve.astype(np.float32), (s, e, a0, a1)
+    if _worker_enhance_kw is not None:
+        enhance_kw = dict(_worker_enhance_kw)
+        crop_margin_ratio = enhance_kw.get("crop_margin_ratio")
+        roi_zyx, origin_xyz = crop_roi_around_fiber(_worker_vol, s, e, crop_margin_ratio=crop_margin_ratio)
+        s_roi = np.asarray(s, dtype=np.float32) - origin_xyz
+        e_roi = np.asarray(e, dtype=np.float32) - origin_xyz
+
+        base_debug = enhance_kw.get("debug_mrc_prefix")
+        fiber_debug = f"{base_debug}_fiber{idx}" if base_debug else None
+        enhance_kw["debug_mrc_prefix"] = fiber_debug
+        enhance_kw.pop("crop_margin_ratio")
+        roi_enh = enhance_volume(roi_zyx, **enhance_kw)
+
+        if fiber_debug is not None:
+            print(f"  fiber {idx}: roi_zyx: {roi_zyx.shape}, origin_xyz: {origin_xyz}, s_roi: {s_roi}, e_roi: {e_roi}")
+
+        track_kw_fiber = dict(_worker_track_kw, debug_mrc_prefix=fiber_debug)
+        curve_roi = trace_fiber_crosscorr(roi_enh, s_roi, e_roi, **track_kw_fiber)
+        curve = (curve_roi.astype(np.float32) + origin_xyz).astype(np.float32)
+    else:
+        curve = trace_fiber_crosscorr(_worker_vol, s, e, **_worker_track_kw)
+        curve = curve.astype(np.float32)
+    return idx, curve, (s, e, a0, a1)
 
 
 def main() -> None:
@@ -619,14 +683,15 @@ def main() -> None:
     parser.add_argument("--spacing", type=float, default=40.0, help="particle spacing along curve in Angstrom (default 40.0)")
     parser.add_argument("--step", type=int, default=1, help="merge +/-step neighboring slices (2*step+1 total) before CC (default 1, real advance step is 2*1+1 = 3)")
 
-    parser.add_argument("--margin-ratio", type=float, default=2.0, help="extra sampling margin in radius units (default 2.0, so the slice box would be 2*(1+2)*140 = 840 angstrom)")
+    parser.add_argument("--crop-margin-ratio", type=float, default=4.0, help="ROI crop margin as multiple of fiber min axis span (default 4, means extend by 4*min_span on each side)")
+    parser.add_argument("--slice-margin-ratio", type=float, default=2.0, help="extra sampling margin in radius units when acquiring 2D slices for CC (default 2, so the slice box would be 2*(1+2)*140 = 840 angstrom)")
     parser.add_argument("--guide-weight", type=float, default=0.20, help="blend weight [0,1] (default 0.20, small = CC dominant).")
     parser.add_argument("--guide-mode", default="momentum", choices=["linear", "momentum"],
                         help="guide strategy: 'linear' uses start->end line (good for straight fibers); "
                              "'momentum' extrapolates from recent trajectory (default, better for curved fibers)")
     parser.add_argument("--cc-upsample", type=int, default=1, help="phase cross-correlation upsample factor (default 1)")
-    parser.add_argument("--curve-points", type=int, default=80, help="curve sample points per fiber")
-    parser.add_argument("--curvature", type=float, default=0.25, help="curve smoothing control [0,1], higher follows data more")
+    parser.add_argument("--curve-points", type=int, default=25, help="curve sample points per fiber (default 25)")
+    parser.add_argument("--curvature", type=float, default=0.25, help="curve smoothing control [0,1], higher follows data more (default 0.25)")
 
     parser.add_argument("--no-enhance", action="store_true", help="don't enhance volume (following normalization, inversion, gaussian, closing, frangi)")
     parser.add_argument("--no-norm", action="store_true", help="don't apply normalization")
@@ -668,22 +733,22 @@ def main() -> None:
         print("error: no fiber selected.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"loading volume: {rec_path}")
     vol = load_volume(rec_path)
-    print(f"volume shape (z,y,x): {vol.shape}")
+    print(f"{rec_path} has volume shape (z,y,x): {vol.shape}")
 
-    print("enhancing volume ...")
     voxel = float(args.voxel_size)
     radius_px = float(args.radius) / voxel
     spacing_px = float(args.spacing) / voxel
     rec_dir = rec_path.parent
     debug_mrc_prefix = rec_dir / rec_path.stem if args.debug else None
-    vol_enh = vol
+
+    # 启用 enhance 时不再在全图做预处理，改为在各 worker 内对每条纤维的 ROI 裁剪后再 enhance，以支持多进程并降低 frangi 等耗时。
+    enhance_kw: Optional[Dict[str, object]] = None
     if not args.no_enhance:
-        vol_enh = enhance_volume(
-            vol=vol,
+        enhance_kw = dict(
             voxel_size=voxel,
             radius_px=radius_px,
+            crop_margin_ratio=float(args.crop_margin_ratio),
             gaussian_sigma=float(args.gaussian_sigma),
             closing_size=int(args.closing_size),
             no_norm=bool(args.no_norm),
@@ -691,6 +756,9 @@ def main() -> None:
             no_frangi=bool(args.no_frangi),
             debug_mrc_prefix=debug_mrc_prefix,
         )
+        print("enhance (norm/invert/gaussian/closing/frangi) will be applied per-fiber on cropped ROI in workers")
+    else:
+        print("skipping volume enhancement (--no-enhance)")
 
     # 追踪参数统一打包传入 worker，避免多进程时参数散落。
     track_kw = dict(
@@ -698,7 +766,7 @@ def main() -> None:
         merge_step=int(args.step),
         curve_points=int(args.curve_points),
         curvature=float(args.curvature),
-        margin_ratio=float(args.margin_ratio),
+        slice_margin_ratio=float(args.slice_margin_ratio),
         guide_weight=float(args.guide_weight),
         guide_mode=str(args.guide_mode),
         cc_upsample=int(args.cc_upsample),
@@ -709,11 +777,11 @@ def main() -> None:
     n_workers = max(1, min(int(args.workers), len(selected)))
     results: Dict[int, Tuple[np.ndarray, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = {}
 
-    # 将增强后体积放入共享内存，子进程只读访问。
-    shm = shared_memory.SharedMemory(create=True, size=vol_enh.nbytes)
+    # 原始体积放入共享内存；启用 enhance 时由各 worker 在 ROI 上做裁剪与增强后追踪。
+    shm = shared_memory.SharedMemory(create=True, size=vol.nbytes)
     try:
-        shm_arr = np.ndarray(vol_enh.shape, dtype=vol_enh.dtype, buffer=shm.buf)
-        shm_arr[:] = vol_enh[:]
+        shm_arr = np.ndarray(vol.shape, dtype=vol.dtype, buffer=shm.buf)
+        shm_arr[:] = vol[:]
         del shm_arr
 
         if n_workers > 1:
@@ -721,14 +789,14 @@ def main() -> None:
             with multiprocessing.Pool(
                 processes=n_workers,
                 initializer=_init_worker,
-                initargs=(shm.name, vol_enh.shape, str(vol_enh.dtype), fibers, track_kw),
+                initargs=(shm.name, vol.shape, str(vol.dtype), fibers, track_kw, enhance_kw),
             ) as pool:
                 for idx, curve, meta in pool.imap_unordered(_trace_worker, selected):
                     results[idx] = (curve, meta)
                     print(f"  fiber {idx}: {len(curve)} curve points")
         else:
             print("tracing fibers in single process")
-            _init_worker(shm.name, vol_enh.shape, str(vol_enh.dtype), fibers, track_kw)
+            _init_worker(shm.name, vol.shape, str(vol.dtype), fibers, track_kw, enhance_kw)
             for idx in selected:
                 ridx, curve, meta = _trace_worker(idx)
                 results[ridx] = (curve, meta)
@@ -765,7 +833,7 @@ def main() -> None:
     coords = np.vstack(all_coords).astype(np.float32)
     angles = np.vstack(all_angles).astype(np.float32)
     write_star(out_star, coords, angles)
-    print(f"STAR saved: {out_star}, total particles: {len(coords)}")
+    print(f"saved {len(coords)} particles in {out_star}")
 
 
 if __name__ == "__main__":
