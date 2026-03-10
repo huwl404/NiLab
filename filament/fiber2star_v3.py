@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-使用 SimpleITK + (可选) cubic/cupy，对 tomogram 中的管状结构进行增强与骨架提取，
+使用 SimpleITK + cucim/cupy，对 tomogram 中的管状结构进行增强与骨架提取，
 再结合 96^3 模板做局部模板匹配，自动筛选疑似 microtubule doublet 骨架，
 输出：
 - 每条通过筛选的骨架曲线的 .axm（ArtiaX CurvedLine，用于 ChimeraX 可视化）
@@ -10,11 +10,12 @@
 
 依赖：
 - 必需：numpy, scipy, SimpleITK, mrcfile, starfile, pandas
-- 可选：cubic (及其依赖 cupy)，用于在 GPU 上加速 NCC 计算（无需 cucim）
+- 可选：cupy, cucim，用于在 GPU 上加速 Frangi vesselness 与 NCC 计算
 """
 from __future__ import annotations
 
 import argparse
+import json
 import atexit
 import math
 import multiprocessing
@@ -30,21 +31,9 @@ import numpy as np
 from scipy.interpolate import UnivariateSpline
 from scipy.spatial.transform import Rotation as R
 
-try:
-    # 仅用于获取 cupy 及在 GPU 上做简单数值运算；不依赖 cucim
-    from cubic.cuda import CUDAManager, ascupy
-except ImportError:
-    CUDAManager = None
-    ascupy = None
-
-try:
-    # 优先使用 cubic.skimage 的 Frangi 实现；若不可用再退回 scikit-image
-    from cubic import skimage as cskimage  # type: ignore[reportMissingImports]
-except ImportError:
-    cskimage = None  # type: ignore[assignment]
-
-from skimage.filters import frangi as skimage_frangi  # type: ignore[reportMissingImports]
-
+import cupy as cp
+import skimage
+from cucim import skimage as cskimage
 
 # ==============================
 # 基础工具函数
@@ -236,15 +225,16 @@ def vector_to_euler_zyz(vec: np.ndarray) -> Tuple[float, float, float]:
 
 
 # ==============================
-# SimpleITK: Frangi / vesselness + Skeleton
+# Frangi / vesselness + Skeleton
 # ==============================
 
-def sitk_vesselness(
+def frangi_vesselness(
     vol_zyx: np.ndarray,
     sigma_min: float,
     sigma_max: float,
     sigma_steps: int,
     bright_tubes: bool = True,
+    use_cpu: bool = True,
 ) -> np.ndarray:
     """
     使用 Frangi 管状增强（Hessian objectness）对 3D 体积做多尺度增强。
@@ -265,20 +255,21 @@ def sitk_vesselness(
     sigmas = np.unique(sigmas).tolist()
     if not sigmas:
         sigmas = [sigma_min]
-
     black_ridges = not bool(bright_tubes)
-    # 优先使用 cubic.skimage.filters.frangi（可利用 GPU/cupy）
-    frangi_func = None
-    if cskimage is not None:
-        try:
-            frangi_func = cskimage.filters.frangi  # type: ignore[attr-defined]
-        except Exception:
-            frangi_func = None
-    if frangi_func is None:
-        frangi_func = skimage_frangi
 
-    out = frangi_func(v.astype(np.float64), sigmas=sigmas, black_ridges=black_ridges, mode="reflect")
-    out = np.asarray(out, dtype=np.float32)
+    if use_cpu:
+        out = skimage.filters.frangi(v, sigmas=sigmas, black_ridges=black_ridges, mode="reflect")
+        out = np.asarray(out, dtype=np.float32)
+        out[np.isnan(out)] = 0.0
+        out[np.isinf(out)] = 0.0
+        if out.size > 0 and float(out.max()) > 0:
+            out /= float(out.max())
+        return out.astype(np.float32)
+
+    # 使用 GPU 版 cucim.frangi：需要 cupy + cucim，输入必须是 cupy.ndarray
+    v_gpu = cp.asarray(v, dtype=cp.float32)
+    out_gpu = cskimage.filters.frangi(v_gpu, sigmas=sigmas, black_ridges=black_ridges, mode="reflect")
+    out = cp.asnumpy(out_gpu).astype(np.float32)
     out[np.isnan(out)] = 0.0
     out[np.isinf(out)] = 0.0
     if out.size > 0 and float(out.max()) > 0:
@@ -407,26 +398,21 @@ def extract_skeletons(
 def ncc_score(patch: np.ndarray, template: np.ndarray, use_gpu: bool = False) -> float:
     """
     计算 patch 与 template 的归一化互相关 (NCC)，返回 [-1,1]。
-    若 use_gpu=True 且 cubic/cupy 可用，则在 GPU 上计算；否则在 CPU 上计算。
+    若 use_gpu=True 且 cupy 可用，则在 GPU 上计算；否则在 CPU 上计算。
     """
     p = np.asarray(patch, dtype=np.float32)
     t = np.asarray(template, dtype=np.float32)
     if p.shape != t.shape:
         return 0.0
 
-    if use_gpu and CUDAManager is not None and ascupy is not None:
+    if use_gpu:
         try:
-            xp_mod = CUDAManager().get_cp()
-            if xp_mod is None:
-                # 没有 GPU，可退回 CPU
-                raise RuntimeError
-            xp = xp_mod
-            pg = ascupy(p)
-            tg = ascupy(t)
+            pg = cp.asarray(p, dtype=cp.float32)
+            tg = cp.asarray(t, dtype=cp.float32)
             pg = pg - pg.mean()
             tg = tg - tg.mean()
             num = float((pg * tg).sum())
-            den = float(xp.sqrt((pg * pg).sum() * (tg * tg).sum()))
+            den = float(cp.sqrt((pg * pg).sum() * (tg * tg).sum()))
             if den <= 0 or not math.isfinite(den):
                 return 0.0
             s = num / den
@@ -634,10 +620,10 @@ def main() -> None:
     parser.add_argument("--spacing", type=float, default=40.0, help="particle spacing along accepted curves (Angstrom, default 40)")
 
     # 执行模式
-    parser.add_argument("--device", choices=("auto", "cpu", "gpu"), default="auto", help="computation device for NCC: auto/cpu/gpu (default auto)")
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4)), help="number of workers for curve-level NCC (CPU only; GPU mode uses single process)")
     parser.add_argument("--out-prefix", default=None, help="output file prefix (default: tomo stem in its folder)")
     parser.add_argument("--debug", action="store_true", help="enable debug outputs (some intermediate MRCs and a .cmm marker file)")
+    parser.add_argument("--use-cpu", action="store_true", help="use CPU (skimage) for Frangi vesselness; use when GPU cuCIM crashes (e.g. RTX 5060 + WSL2)")
 
     args = parser.parse_args()
 
@@ -675,8 +661,8 @@ def main() -> None:
         save_mrc(out_prefix.with_name(out_prefix.name + "_norm.mrc"), norm, voxel_size=voxel)
 
     # vesselness
-    print(f"computing SimpleITK vesselness: sigma in [{args.sigma_min}, {args.sigma_max}] with {args.sigma_steps} scales")
-    vess = sitk_vesselness(norm, sigma_min=args.sigma_min, sigma_max=args.sigma_max, sigma_steps=args.sigma_steps, bright_tubes=True)
+    print(f"computing vesselness: sigma in [{args.sigma_min}, {args.sigma_max}] with {args.sigma_steps} scales")
+    vess = frangi_vesselness(norm, sigma_min=args.sigma_min, sigma_max=args.sigma_max, sigma_steps=args.sigma_steps, bright_tubes=True, use_cpu=getattr(args, "use_cpu", False))
     if args.debug:
         save_mrc(out_prefix.with_name(out_prefix.name + "_vesselness.mrc"), vess, voxel_size=voxel)
 
@@ -704,26 +690,9 @@ def main() -> None:
             axm_path = out_prefix.parent / f"{out_prefix.name}_skel{i}.axm"
             write_axm(axm_path, smoothed, voxel_size=voxel)
 
-    # 选择 device 模式（仅影响 NCC）
-    use_gpu = False
-    if args.device == "gpu":
-        if CUDAManager is None:
-            print("warning: cubic not available; cannot use GPU, falling back to CPU")
-        else:
-            if CUDAManager().get_cp() is None:
-                print("warning: cupy GPU not available; falling back to CPU")
-            else:
-                use_gpu = True
-    elif args.device == "auto":
-        if CUDAManager is not None and CUDAManager().get_cp() is not None:
-            use_gpu = True
-    # GPU 模式下使用单进程
-    n_workers = 1 if use_gpu else max(1, min(int(args.workers), len(curves)))
+    n_workers = max(1, min(int(args.workers), len(curves)))
 
-    print(
-        f"NCC matching on curves: device={'GPU' if use_gpu else 'CPU'}, "
-        f"workers={n_workers}"
-    )
+    print(f"NCC matching on curves: workers={n_workers}")
 
     # 共享 tomogram
     shm = shared_memory.SharedMemory(create=True, size=vol.nbytes)
@@ -733,10 +702,7 @@ def main() -> None:
         shm_arr[:] = vol[:]
         del shm_arr
 
-        cfg = {
-            "use_gpu": bool(use_gpu),
-            "block_step_px": float(args.block_step) / float(voxel),
-        }
+        cfg = {"block_step_px": float(args.block_step) / float(voxel)}
         tasks = list(enumerate(curves))
 
         if n_workers > 1:
