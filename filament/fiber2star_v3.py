@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import atexit
 import math
 import multiprocessing
@@ -32,8 +31,8 @@ from scipy.interpolate import UnivariateSpline
 from scipy.spatial.transform import Rotation as R
 
 import cupy as cp
-import skimage
 from cucim import skimage as cskimage
+from cucim.core.operations import intensity as cintensity
 
 # ==============================
 # 基础工具函数
@@ -53,15 +52,8 @@ def save_mrc(path: Path, data: np.ndarray, voxel_size: float = 1.0) -> None:
         try:
             m.voxel_size = float(voxel_size)
         except Exception:
+            print(f"Failed to set voxel size, but saving anyway.")
             pass
-
-
-def normalize_percentile(vol: np.ndarray, low: float = 2.0, high: float = 98.0) -> np.ndarray:
-    lo, hi = np.percentile(vol, [low, high])
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        return np.zeros_like(vol, dtype=np.float32)
-    x = (vol - lo) / (hi - lo)
-    return np.clip(x, 0.0, 1.0).astype(np.float32)
 
 
 def resample_curve_by_spacing(curve_xyz: np.ndarray, spacing_px: float) -> np.ndarray:
@@ -228,13 +220,32 @@ def vector_to_euler_zyz(vec: np.ndarray) -> Tuple[float, float, float]:
 # Frangi / vesselness + Skeleton
 # ==============================
 
+def normalize_percentile(vol: np.ndarray, low: float = 2.0, high: float = 98.0) -> np.ndarray:
+    """使用 GPU 计算分位数 + 归一化到 [0,1]。"""
+    v_gpu = cp.asarray(vol, dtype=cp.float32)
+    lo_gpu, hi_gpu = cp.percentile(v_gpu, [low, high])
+    lo = float(lo_gpu)
+    hi = float(hi_gpu)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return np.zeros_like(vol, dtype=np.float32)
+    norm_gpu = cintensity.normalize_data(v_gpu, 1.0, lo, hi, type="range")
+    norm_gpu = cp.clip(norm_gpu, 0.0, 1.0)
+    return cp.asnumpy(norm_gpu).astype(np.float32)
+
+
+def gaussian_smooth(vol: np.ndarray, sigma: float) -> np.ndarray:
+    """使用 GPU 做 3D 高斯平滑。"""
+    v_gpu = cp.asarray(vol, dtype=cp.float32)
+    gauss_sigma = max(0.5, float(sigma))
+    v_gpu = cskimage.filters.gaussian(v_gpu, sigma=gauss_sigma, preserve_range=True)
+    return cp.asnumpy(v_gpu).astype(np.float32)
+
+
 def frangi_vesselness(
     vol_zyx: np.ndarray,
     sigma_min: float,
     sigma_max: float,
     sigma_steps: int,
-    bright_tubes: bool = True,
-    use_cpu: bool = True,
 ) -> np.ndarray:
     """
     使用 Frangi 管状增强（Hessian objectness）对 3D 体积做多尺度增强。
@@ -255,20 +266,10 @@ def frangi_vesselness(
     sigmas = np.unique(sigmas).tolist()
     if not sigmas:
         sigmas = [sigma_min]
-    black_ridges = not bool(bright_tubes)
-
-    if use_cpu:
-        out = skimage.filters.frangi(v, sigmas=sigmas, black_ridges=black_ridges, mode="reflect")
-        out = np.asarray(out, dtype=np.float32)
-        out[np.isnan(out)] = 0.0
-        out[np.isinf(out)] = 0.0
-        if out.size > 0 and float(out.max()) > 0:
-            out /= float(out.max())
-        return out.astype(np.float32)
 
     # 使用 GPU 版 cucim.frangi：需要 cupy + cucim，输入必须是 cupy.ndarray
     v_gpu = cp.asarray(v, dtype=cp.float32)
-    out_gpu = cskimage.filters.frangi(v_gpu, sigmas=sigmas, black_ridges=black_ridges, mode="reflect")
+    out_gpu = cskimage.filters.frangi(v_gpu, sigmas=sigmas, black_ridges=True, mode="reflect",)
     out = cp.asnumpy(out_gpu).astype(np.float32)
     out[np.isnan(out)] = 0.0
     out[np.isinf(out)] = 0.0
@@ -299,10 +300,10 @@ def extract_skeletons(
     th = float(np.percentile(v[np.isfinite(v)], vesselness_percentile))
     mask = (v >= th).astype(np.uint8)
     if mask.sum() == 0:
+        print("  mask is empty")
         return []
 
     mask_img = sitk.GetImageFromArray(mask)
-
     # 2) 连通域过滤
     cc = sitk.ConnectedComponent(mask_img)
     ls = sitk.LabelShapeStatisticsImageFilter()
@@ -313,6 +314,7 @@ def extract_skeletons(
         if n_pix >= max(1, int(min_region_voxels)):
             kept_labels.append(int(lab))
     if not kept_labels:
+        print("  no kept labels")
         return []
 
     cc_np = sitk.GetArrayFromImage(cc)
@@ -602,15 +604,16 @@ def main() -> None:
     )
     parser.add_argument("--tomo", required=True, help="input tomogram .mrc path")
     parser.add_argument("--template", required=True, help="template .mrc path (e.g. TZ_template_bin4.mrc)")
-    parser.add_argument("--voxel-size", type=float, required=True, help="voxel size in Angstrom")
+    parser.add_argument("--voxel-size", type=float, required=True, help="voxel size (Å) (required, for coordinate scale conversion)")
+    parser.add_argument("--bin", type=int, default=2, help="integer binning factor applied to both tomogram and template before processing (default 2)")
 
     # vesselness / skeleton 参数
-    parser.add_argument("--sigma-min", type=float, default=5.0, help="minimum sigma (voxel) for multi-scale vesselness (default 5.0), approximately 0.5 * small radius of the filament")
+    parser.add_argument("--gauss-sigma", type=float, default=1.0, help="3D gaussian sigma for vesselness enhancement (default 1.0)")
+    parser.add_argument("--sigma-min", type=float, default=3.0, help="minimum sigma (voxel) for multi-scale vesselness (default 3.0), approximately 0.5 * small radius of the filament")
     parser.add_argument("--sigma-max", type=float, default=13.0, help="maximum sigma (voxel) for multi-scale vesselness (default 13.0), approximately 1.0 * large radius of the filament")
-    parser.add_argument("--sigma-steps", type=int, default=5, help="number of scales for vesselness (default 5)")
-    parser.add_argument("--invert", action="store_true", help="invert tomogram after percentile normalization so dark filaments become bright")
+    parser.add_argument("--sigma-steps", type=int, default=6, help="number of scales for vesselness (default 6)")
     parser.add_argument("--vesselness-percentile", type=float, default=95.0, help="percentile threshold on vesselness to build binary mask (default 95)")
-    parser.add_argument("--min-region-voxels", type=int, default=1000000, help="minimum voxel count for connected components before skeletonization (default 1000000)")
+    parser.add_argument("--min-region-voxels", type=int, default=200000, help="minimum voxel count for connected components before skeletonization (default 200000)")
     parser.add_argument("--min-skel-length", type=float, default=200.0, help="minimum skeleton length in Angstrom (approximate, default 200)")
 
     # 模板匹配 / 采样
@@ -623,12 +626,13 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4)), help="number of workers for curve-level NCC (CPU only; GPU mode uses single process)")
     parser.add_argument("--out-prefix", default=None, help="output file prefix (default: tomo stem in its folder)")
     parser.add_argument("--debug", action="store_true", help="enable debug outputs (some intermediate MRCs and a .cmm marker file)")
-    parser.add_argument("--use-cpu", action="store_true", help="use CPU (skimage) for Frangi vesselness; use when GPU cuCIM crashes (e.g. RTX 5060 + WSL2)")
 
     args = parser.parse_args()
 
+    voxel = float(args.voxel_size)
     if args.voxel_size <= 0:
-        raise SystemExit("error: --voxel-size must be > 0")
+        print("error: --voxel-size must be > 0")
+        return
 
     tomo_path = Path(args.tomo).resolve()
     tpl_path = Path(args.template).resolve()
@@ -652,22 +656,41 @@ def main() -> None:
     template = load_mrc(tpl_path)
     print(f"  template shape (z,y,x): {template.shape}")
 
-    voxel = float(args.voxel_size)
-    # 预处理：归一化 + 可选取反
+    bin_factor = max(1, int(args.bin))
+    if bin_factor > 1:
+        print(f"binning tomogram and template by factor {bin_factor}")
+        vol_gpu = cp.asarray(vol, dtype=cp.float32)
+        tpl_gpu = cp.asarray(template, dtype=cp.float32)
+        vol_gpu = cskimage.transform.downscale_local_mean(vol_gpu, (bin_factor, bin_factor, bin_factor))
+        tpl_gpu = cskimage.transform.downscale_local_mean(tpl_gpu, (bin_factor, bin_factor, bin_factor))
+        vol = cp.asnumpy(vol_gpu).astype(np.float32)
+        template = cp.asnumpy(tpl_gpu).astype(np.float32)
+        voxel *= float(bin_factor)
+        print(f"  binned volume shape (z,y,x): {vol.shape}")
+        print(f"  binned template shape (z,y,x): {template.shape}")
+
+        if args.debug:
+            save_mrc(out_prefix.with_name(out_prefix.name + "_binned_tomogram.mrc"), vol, voxel_size=voxel)
+            save_mrc(out_prefix.with_name(out_prefix.name + "_binned_template.mrc"), template, voxel_size=voxel)
+
+    # 预处理：GPU 上做分位数归一化 + 可选取反
     norm = normalize_percentile(vol, low=2.0, high=98.0)
-    if args.invert:
-        norm = 1.0 - norm
     if args.debug:
         save_mrc(out_prefix.with_name(out_prefix.name + "_norm.mrc"), norm, voxel_size=voxel)
 
+    # gaussian smooth
+    gauss = gaussian_smooth(norm, sigma=args.gauss_sigma)
+    if args.debug:
+        save_mrc(out_prefix.with_name(out_prefix.name + "_gauss.mrc"), gauss, voxel_size=voxel)
+
     # vesselness
     print(f"computing vesselness: sigma in [{args.sigma_min}, {args.sigma_max}] with {args.sigma_steps} scales")
-    vess = frangi_vesselness(norm, sigma_min=args.sigma_min, sigma_max=args.sigma_max, sigma_steps=args.sigma_steps, bright_tubes=True, use_cpu=getattr(args, "use_cpu", False))
+    vess = frangi_vesselness(gauss, sigma_min=args.sigma_min, sigma_max=args.sigma_max, sigma_steps=args.sigma_steps)
     if args.debug:
         save_mrc(out_prefix.with_name(out_prefix.name + "_vesselness.mrc"), vess, voxel_size=voxel)
 
     # skeleton 提取
-    print("extracting skeleton curves from vesselness volume ...")
+    print("extracting skeleton curves from vesselness volume")
     curves_raw = extract_skeletons(vess, vesselness_percentile=float(args.vesselness_percentile), min_region_voxels=int(args.min_region_voxels), voxel_size=voxel, min_skel_length_A=float(args.min_skel_length))
     print(f"  got {len(curves_raw)} raw skeleton curves")
     if not curves_raw:
