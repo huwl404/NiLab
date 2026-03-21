@@ -217,7 +217,7 @@ def vector_to_euler_zyz(vec: np.ndarray) -> Tuple[float, float, float]:
 
 
 # ==============================
-# Frangi / vesselness + Skeleton
+# Vesselness + Skeleton
 # ==============================
 
 def normalize_percentile(vol: np.ndarray, low: float = 2.0, high: float = 98.0) -> np.ndarray:
@@ -241,17 +241,18 @@ def gaussian_smooth(vol: np.ndarray, sigma: float) -> np.ndarray:
     return cp.asnumpy(v_gpu).astype(np.float32)
 
 
-def frangi_vesselness(
+def sato_vesselness(
     vol_zyx: np.ndarray,
     sigma_min: float,
     sigma_max: float,
     sigma_steps: int,
 ) -> np.ndarray:
     """
-    使用 Frangi 管状增强（Hessian objectness）对 3D 体积做多尺度增强。
+    使用 Sato 管状增强（Hessian-based tubularity）对 3D 体积做多尺度增强。
+
     参数说明（所有 sigma 以“像素”为单位）：
         vol_zyx    : 归一化 / 可选 invert 后的体积，形状 (z, y, x)
-        sigma_min  : Frangi 多尺度中最小 sigma（像素），推荐略小于目标半径
+        sigma_min  : Sato 多尺度中最小 sigma（像素），建议略小于目标内半径
         sigma_max  : 最大 sigma（像素），推荐略小于或接近目标外半径
         sigma_steps: sigma 采样个数，通常 3–6 即可
         bright_tubes: True 表示“亮管”增强；若原图是暗管，先 --invert
@@ -267,9 +268,9 @@ def frangi_vesselness(
     if not sigmas:
         sigmas = [sigma_min]
 
-    # 使用 GPU 版 cucim.frangi：需要 cupy + cucim，输入必须是 cupy.ndarray
+    # 使用 GPU 版 cucim：需要 cupy + cucim，输入必须是 cupy.ndarray
     v_gpu = cp.asarray(v, dtype=cp.float32)
-    out_gpu = cskimage.filters.frangi(v_gpu, sigmas=sigmas, black_ridges=True, mode="reflect",)
+    out_gpu = cskimage.filters.sato(v_gpu, sigmas=sigmas, black_ridges=True, mode="reflect",)
     out = cp.asnumpy(out_gpu).astype(np.float32)
     out[np.isnan(out)] = 0.0
     out[np.isinf(out)] = 0.0
@@ -284,48 +285,61 @@ def extract_skeletons(
     min_region_voxels: int,
     voxel_size: float,
     min_skel_length_A: float,
+    debug_prefix: Optional[Path] = None,
 ) -> List[np.ndarray]:
     """
-    从 vesselness 体积中：
-    1) 百分位阈值二值化
-    2) 连通域过滤（体素数）
-    3) BinaryThinning 骨架
-    4) 再按连通域划分骨架，按 PCA 排序为近似有序曲线
-    5) 过滤太短的骨架
+    从 vesselness 体积中构建候选管状骨架：
+
+    1) 对 vesselness 做百分位阈值二值化，得到初始 mask；
+    2) 在 GPU 上使用 cucim.morphology.remove_small_holes / remove_small_objects 清理小孔与小连通域（基于体素数）；
+    3) 将清理后的 mask 转回 CPU，用 SimpleITK.BinaryThinning 做 3D 骨架提取；
+    4) 对骨架连通域再次分割，并按 PCA 主轴排序为近似有序曲线；
+    5) 以物理长度（min_skel_length_A）过滤过短骨架。
 
     返回：每条骨架的一组点 (n_i,3)，坐标单位为像素 (x,y,z)，已排序但尚未平滑。
     """
     v = np.asarray(vesselness_zyx, dtype=np.float32)
-    # 1) 二值化
-    th = float(np.percentile(v[np.isfinite(v)], vesselness_percentile))
-    mask = (v >= th).astype(np.uint8)
-    if mask.sum() == 0:
-        print("  mask is empty")
-        return []
 
-    mask_img = sitk.GetImageFromArray(mask)
-    # 2) 连通域过滤
-    cc = sitk.ConnectedComponent(mask_img)
-    ls = sitk.LabelShapeStatisticsImageFilter()
-    ls.Execute(cc)
-    kept_labels: List[int] = []
-    for lab in ls.GetLabels():
-        n_pix = int(ls.GetNumberOfPixels(lab))
-        if n_pix >= max(1, int(min_region_voxels)):
-            kept_labels.append(int(lab))
-    if not kept_labels:
-        print("  no kept labels")
+    # 1) 在 GPU 上做百分位阈值二值化
+    v_gpu = cp.asarray(v, dtype=cp.float32)
+    finite = cp.isfinite(v_gpu)
+    if not bool(finite.sum().get()):
+        print("  vesselness has no finite values")
         return []
+    th = float(cp.percentile(v_gpu[finite], vesselness_percentile))
+    mask_gpu = v_gpu >= th
+    if not bool(mask_gpu.sum().get()):
+        print("  mask is empty after thresholding")
+        return []
+    if debug_prefix is not None:
+        save_mrc(debug_prefix.with_name(debug_prefix.name + "_4_mask_raw.mrc"), cp.asnumpy(mask_gpu.astype(cp.float32)), voxel_size=voxel_size)
 
-    cc_np = sitk.GetArrayFromImage(cc)
-    filtered_mask = np.isin(cc_np, kept_labels).astype(np.uint8)
-    filt_img = sitk.GetImageFromArray(filtered_mask)
+    # 2) 删除小前景（1）
+    mask_gpu = cskimage.morphology.remove_small_objects(mask_gpu, min_size=max(1, min_region_voxels), connectivity=1)
+    if not bool(mask_gpu.sum().get()):
+        print("  mask removed completely after small-object filtering")
+        return []
+    if debug_prefix is not None:
+        save_mrc(debug_prefix.with_name(debug_prefix.name + "_5_mask_clean_objects.mrc"), cp.asnumpy(mask_gpu.astype(cp.float32)), voxel_size=voxel_size)
+    
+    # 2）删除小背景（0）
+    mask_gpu = cskimage.morphology.remove_small_holes(mask_gpu, area_threshold=max(1, min_region_voxels), connectivity=1)  
+    if not bool(mask_gpu.sum().get()):
+        print("  mask removed completely after small-hole filtering")
+        return []
+    if debug_prefix is not None:
+        save_mrc(debug_prefix.with_name(debug_prefix.name + "_6_mask_clean_holes.mrc"), cp.asnumpy(mask_gpu.astype(cp.float32)), voxel_size=voxel_size)
 
     # 3) 3D 骨架
-    skel_img = sitk.BinaryThinning(filt_img)
+    mask = cp.asnumpy(mask_gpu.astype(np.uint8))
+    mask_img = sitk.GetImageFromArray(mask)
+    skel_img = sitk.BinaryThinning(mask_img)
     skel_np = sitk.GetArrayFromImage(skel_img)
     if skel_np.sum() == 0:
+        print("  skeleton is empty after thinning")
         return []
+    if debug_prefix is not None:
+        save_mrc(debug_prefix.with_name(debug_prefix.name + "_7_skel.mrc"), skel_np.astype(np.float32), voxel_size=voxel_size)
 
     # 4) 骨架连通域，再按 PCA 排序得到“曲线”
     skel_cc = sitk.ConnectedComponent(skel_img)
@@ -334,9 +348,6 @@ def extract_skeletons(
     ls2.Execute(skel_cc)
 
     curves: List[np.ndarray] = []
-    sz, sy, sx = skel_np.shape
-    min_len_vox = float(min_skel_length_A) / float(voxel_size)
-
     for lab in ls2.GetLabels():
         # 当前骨架连通域所有点
         pts_zyx = np.argwhere(skel_cc_np == int(lab))
@@ -356,16 +367,7 @@ def extract_skeletons(
             _, _, vh = np.linalg.svd(centered, full_matrices=False)
             main_dir = vh[0]
         except Exception:
-            # 退化情况：用 bbox 近似长度
-            lo = pts_xyz.min(axis=0)
-            hi = pts_xyz.max(axis=0)
-            length_vox = float(np.linalg.norm(hi - lo))
-            if length_vox * float(voxel_size) < min_skel_length_A:
-                continue
-            # 简单按 x 排序
-            order = np.argsort(pts_xyz[:, 0])
-            pts_sorted = pts_xyz[order]
-            curves.append(pts_sorted.astype(np.float32))
+            print("  PCA failed, skipping curve")
             continue
 
         proj = centered @ main_dir
@@ -609,10 +611,10 @@ def main() -> None:
 
     # vesselness / skeleton 参数
     parser.add_argument("--gauss-sigma", type=float, default=1.0, help="3D gaussian sigma for vesselness enhancement (default 1.0)")
-    parser.add_argument("--sigma-min", type=float, default=3.0, help="minimum sigma (voxel) for multi-scale vesselness (default 3.0), approximately 0.5 * small radius of the filament")
+    parser.add_argument("--sigma-min", type=float, default=11.0, help="minimum sigma (voxel) for multi-scale vesselness (default 11.0), approximately 0.5 * small radius of the filament")
     parser.add_argument("--sigma-max", type=float, default=13.0, help="maximum sigma (voxel) for multi-scale vesselness (default 13.0), approximately 1.0 * large radius of the filament")
-    parser.add_argument("--sigma-steps", type=int, default=6, help="number of scales for vesselness (default 6)")
-    parser.add_argument("--vesselness-percentile", type=float, default=95.0, help="percentile threshold on vesselness to build binary mask (default 95)")
+    parser.add_argument("--sigma-steps", type=int, default=4, help="number of scales for vesselness (default 4)")
+    parser.add_argument("--vesselness-percentile", type=float, default=80.0, help="percentile threshold on vesselness to build binary mask (default 80)")
     parser.add_argument("--min-region-voxels", type=int, default=200000, help="minimum voxel count for connected components before skeletonization (default 200000)")
     parser.add_argument("--min-skel-length", type=float, default=200.0, help="minimum skeleton length in Angstrom (approximate, default 200)")
 
@@ -670,28 +672,35 @@ def main() -> None:
         print(f"  binned template shape (z,y,x): {template.shape}")
 
         if args.debug:
-            save_mrc(out_prefix.with_name(out_prefix.name + "_binned_tomogram.mrc"), vol, voxel_size=voxel)
-            save_mrc(out_prefix.with_name(out_prefix.name + "_binned_template.mrc"), template, voxel_size=voxel)
+            save_mrc(out_prefix.with_name(out_prefix.name + "_0_binned_tomogram.mrc"), vol, voxel_size=voxel)
+            save_mrc(out_prefix.with_name(out_prefix.name + "_0_binned_template.mrc"), template, voxel_size=voxel)
 
-    # 预处理：GPU 上做分位数归一化 + 可选取反
+    # 预处理：GPU 上做分位数归一化
     norm = normalize_percentile(vol, low=2.0, high=98.0)
     if args.debug:
-        save_mrc(out_prefix.with_name(out_prefix.name + "_norm.mrc"), norm, voxel_size=voxel)
+        save_mrc(out_prefix.with_name(out_prefix.name + "_1_norm.mrc"), norm, voxel_size=voxel)
 
     # gaussian smooth
     gauss = gaussian_smooth(norm, sigma=args.gauss_sigma)
     if args.debug:
-        save_mrc(out_prefix.with_name(out_prefix.name + "_gauss.mrc"), gauss, voxel_size=voxel)
+        save_mrc(out_prefix.with_name(out_prefix.name + "_2_gauss.mrc"), gauss, voxel_size=voxel)
 
     # vesselness
     print(f"computing vesselness: sigma in [{args.sigma_min}, {args.sigma_max}] with {args.sigma_steps} scales")
-    vess = frangi_vesselness(gauss, sigma_min=args.sigma_min, sigma_max=args.sigma_max, sigma_steps=args.sigma_steps)
+    vess = sato_vesselness(gauss, sigma_min=args.sigma_min, sigma_max=args.sigma_max, sigma_steps=args.sigma_steps)
     if args.debug:
-        save_mrc(out_prefix.with_name(out_prefix.name + "_vesselness.mrc"), vess, voxel_size=voxel)
+        save_mrc(out_prefix.with_name(out_prefix.name + "_3_sato.mrc"), vess, voxel_size=voxel)
 
     # skeleton 提取
     print("extracting skeleton curves from vesselness volume")
-    curves_raw = extract_skeletons(vess, vesselness_percentile=float(args.vesselness_percentile), min_region_voxels=int(args.min_region_voxels), voxel_size=voxel, min_skel_length_A=float(args.min_skel_length))
+    curves_raw = extract_skeletons(
+        vess,
+        vesselness_percentile=float(args.vesselness_percentile),
+        min_region_voxels=int(args.min_region_voxels),
+        voxel_size=voxel,
+        min_skel_length_A=float(args.min_skel_length),
+        debug_prefix=out_prefix if args.debug else None,
+    )
     print(f"  got {len(curves_raw)} raw skeleton curves")
     if not curves_raw:
         print("no skeleton found; nothing to do")
