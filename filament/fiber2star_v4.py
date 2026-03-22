@@ -45,14 +45,14 @@ warnings.filterwarnings(
 import argparse
 import math
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import mrcfile
 import starfile
 from scipy.interpolate import UnivariateSpline
-from scipy.spatial.transform import Rotation as R  # kept for potential future use
+from scipy.spatial.transform import Rotation as R
 
 import cupy as cp
 from cupyx.scipy.ndimage import convolve as cp_convolve
@@ -784,11 +784,7 @@ def smooth_curve(points_xyz: np.ndarray, curve_points: int = 200, curvature: flo
 
 
 def write_star(out_path: Path, coords_xyz: np.ndarray, angles: np.ndarray) -> None:
-    """Write particle coordinates + Euler angles to STAR file (pixel coords, degrees).
-
-    *coords_zyx* follows NumPy volume indexing [Z, Y, X].
-    MRC/RELION convention: X = column (fastest), Y = row, Z = section (slowest).
-    """
+    """Write particle coordinates + Euler angles to STAR file (pixel coords, degrees)."""
     c = np.asarray(coords_xyz, dtype=np.float32)
     angles = np.asarray(angles, dtype=np.float32)
     df = pd.DataFrame(
@@ -796,9 +792,6 @@ def write_star(out_path: Path, coords_xyz: np.ndarray, angles: np.ndarray) -> No
             "rlnCoordinateX": c[:, 0],
             "rlnCoordinateY": c[:, 1],
             "rlnCoordinateZ": c[:, 2],
-            "rlnOriginX": np.zeros(len(c), dtype=np.float32),
-            "rlnOriginY": np.zeros(len(c), dtype=np.float32),
-            "rlnOriginZ": np.zeros(len(c), dtype=np.float32),
             "rlnAngleRot": angles[:, 0],
             "rlnAngleTilt": angles[:, 1],
             "rlnAnglePsi": angles[:, 2],
@@ -810,11 +803,9 @@ def write_star(out_path: Path, coords_xyz: np.ndarray, angles: np.ndarray) -> No
 def vector_to_euler_zyz(vec_xyz: np.ndarray) -> Tuple[float, float, float]:
     """Convert a 3D direction vector (xyz array order) to RELION ZYZ Euler angles.
 
-    RELION convention (Heymann et al. 2005):
-      R = Rz(rot) · Ry(tilt) · Rz(psi)  rotates reference → observation.
-      R @ [0,0,1] = direction  ⇒  reference Z aligns with fiber direction.
-
-    psi is set to 0 (in-plane rotation is undefined for a single direction).
+    We solve a rotation that maps reference Z axis [0,0,1] onto vec_xyz,
+    then convert that rotation into intrinsic ZYZ Euler angles
+    (rlnAngleRot, rlnAngleTilt, rlnAnglePsi).
     Returns (rot, tilt, psi) in degrees.
     """
     v = np.asarray(vec_xyz, dtype=np.float64).ravel()
@@ -822,10 +813,79 @@ def vector_to_euler_zyz(vec_xyz: np.ndarray) -> Tuple[float, float, float]:
     if not np.isfinite(n) or n < 1e-6:
         return 0.0, 0.0, 0.0
     v = v / n
-    vx, vy, vz = v[0], v[1], v[2]
-    tilt = math.degrees(math.acos(np.clip(vz, -1.0, 1.0)))
-    rot = math.degrees(math.atan2(vy, vx))
-    return rot, tilt, 0.0
+    z_ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    try:
+        rot_obj, _ = R.align_vectors(v[None, :], z_ref[None, :])
+    except Exception:
+        # Fallback: explicit shortest-arc rotation from z_ref to v.
+        axis = np.cross(z_ref, v)
+        s = float(np.linalg.norm(axis))
+        c = float(np.clip(np.dot(z_ref, v), -1.0, 1.0))
+        if s < 1e-8:
+            if c > 0.0:
+                rot_obj = R.identity()
+            else:
+                rot_obj = R.from_rotvec(np.pi * np.array([1.0, 0.0, 0.0], dtype=np.float64))
+        else:
+            axis /= s
+            kx, ky, kz = axis
+            K = np.array(
+                [[0.0, -kz, ky],
+                 [kz, 0.0, -kx],
+                 [-ky, kx, 0.0]],
+                dtype=np.float64,
+            )
+            rot_mat = np.eye(3, dtype=np.float64) + K * s + (K @ K) * (1.0 - c)
+            rot_obj = R.from_matrix(rot_mat)
+    ang = rot_obj.as_euler("ZYZ", degrees=True)
+    return float(ang[0]), float(ang[1]), float(ang[2])
+
+
+def estimate_tangents(points_xyz: np.ndarray, dominant_dir: Optional[np.ndarray] = None) -> np.ndarray:
+    """Estimate per-point unit tangents and enforce consistent tangent sign."""
+    pts = np.asarray(points_xyz, dtype=np.float64)
+    n = len(pts)
+    if n == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    tang = np.zeros((n, 3), dtype=np.float64)
+    if n == 1:
+        tang[0] = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    else:
+        tang[0] = pts[1] - pts[0]
+        tang[-1] = pts[-1] - pts[-2]
+        if n > 2:
+            tang[1:-1] = 0.5 * (pts[2:] - pts[:-2])
+
+    norms = np.linalg.norm(tang, axis=1)
+    valid = norms > 1e-8
+    if not np.any(valid):
+        tang[:] = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        return tang.astype(np.float32)
+
+    tang[valid] /= norms[valid, None]
+    first_valid = int(np.argmax(valid))
+    for i in range(first_valid - 1, -1, -1):
+        tang[i] = tang[i + 1]
+    for i in range(first_valid + 1, n):
+        if not valid[i]:
+            tang[i] = tang[i - 1]
+
+    if dominant_dir is not None:
+        d = np.asarray(dominant_dir, dtype=np.float64).ravel()
+        dn = np.linalg.norm(d)
+        if np.isfinite(dn) and dn > 1e-8:
+            d = d / dn
+            for i in range(n):
+                if np.dot(tang[i], d) < 0.0:
+                    tang[i] = -tang[i]
+            return tang.astype(np.float32)
+
+    # No dominant direction: keep orientation continuous along the curve.
+    for i in range(1, n):
+        if np.dot(tang[i], tang[i - 1]) < 0.0:
+            tang[i] = -tang[i]
+    return tang.astype(np.float32)
 
 
 # ==============================
@@ -834,7 +894,7 @@ def vector_to_euler_zyz(vec_xyz: np.ndarray) -> Tuple[float, float, float]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=("Fiber tracking in cryo-ET tomograms: Sato vesselness → candidate segments → directional merging → .star output."))
+    parser = argparse.ArgumentParser(description="Fiber tracking in cryo-ET tomograms: Sato vesselness → candidate segments → directional merging → .star output.")
     parser.add_argument("--tomo", required=True, help="input tomogram .mrc path (dark tubes)")
     parser.add_argument("--voxel-size", type=float, required=True, help="voxel size in Angstrom (required)")
     parser.add_argument("--bin", type=int, default=2, help="integer binning factor (default 2)")
@@ -1043,22 +1103,11 @@ def main() -> None:
         if len(pts) == 0:
             continue
 
-        if len(fiber) >= 2:
-            centered = fiber - fiber.mean(axis=0)
-            _, _, vt = np.linalg.svd(centered, full_matrices=False)
-            ext_dir = vt[0].astype(np.float64)
-            if np.dot(ext_dir, fiber[-1] - fiber[0]) < 0:
-                ext_dir = -ext_dir
-            dn = np.linalg.norm(ext_dir)
-            if dn < 1e-6:
-                ext_dir = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-            else:
-                ext_dir = ext_dir / dn
-        else:
-            ext_dir = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-
-        rot, tilt, psi = vector_to_euler_zyz(ext_dir)
-        angs = np.tile(np.array([rot, tilt, psi], dtype=np.float32), (len(pts), 1))
+        tangents = estimate_tangents(pts, dominant_dir=dominant_dir)
+        angs = np.zeros((len(pts), 3), dtype=np.float32)
+        for i, t in enumerate(tangents):
+            rot, tilt, psi = vector_to_euler_zyz(t)
+            angs[i] = np.array([rot, tilt, psi], dtype=np.float32)
         all_coords.append(pts.astype(np.float32))
         all_angles.append(angs)
 
