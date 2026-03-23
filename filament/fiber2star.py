@@ -27,9 +27,7 @@ Pipeline:
   8. Smooth curves, sample particles, output .star + .axm
 
 Output:
-  - Per-fiber .axm files (ArtiaX CurvedLine for ChimeraX)
   - Combined particles .star file (positions + orientations)
-  - Optional debug .mrc and .cmm files
 """
 from __future__ import annotations
 
@@ -43,8 +41,11 @@ warnings.filterwarnings(
 )
 
 import argparse
-import math
 from pathlib import Path
+from glob import glob, has_magic
+import math
+import re
+import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -748,7 +749,12 @@ def resample_curve_by_spacing(curve_xyz: np.ndarray, spacing_px: float) -> np.nd
 
 
 def smooth_curve(points_xyz: np.ndarray, curve_points: int = 200, curvature: float = 0.25) -> np.ndarray:
-    """Spline-smooth a discrete point sequence. curvature in [0,1]: 0=straighter, 1=tighter fit."""
+    """Spline-smooth a point sequence and blend with endpoint line by curvature.
+
+    curvature in [0,1]:
+      - 0.0 => straight line between endpoints
+      - 1.0 => keep full spline shape
+    """
     pts = np.asarray(points_xyz, dtype=np.float32)
     n = len(pts)
     if n < 2:
@@ -763,20 +769,26 @@ def smooth_curve(points_xyz: np.ndarray, curve_points: int = 200, curvature: flo
         return out.astype(np.float32)
 
     curv = float(np.clip(curvature, 0.0, 1.0))
-    smooth_factor = (1.0 - curv) * n * 0.75
+    # Keep a mild smoothing baseline for denoising; geometric bending is
+    # controlled by the explicit line-vs-spline blend below.
+    smooth_factor = max(1e-6, n * 0.15)
+    uq = np.linspace(0.0, 1.0, curve_points, dtype=np.float32)
 
     try:
         us = s / total
         tck_x = UnivariateSpline(us, pts[:, 0], s=smooth_factor, k=min(3, n - 1))
         tck_y = UnivariateSpline(us, pts[:, 1], s=smooth_factor, k=min(3, n - 1))
         tck_z = UnivariateSpline(us, pts[:, 2], s=smooth_factor, k=min(3, n - 1))
-        uq = np.linspace(0.0, 1.0, curve_points, dtype=np.float32)
         curve = np.vstack([tck_x(uq), tck_y(uq), tck_z(uq)]).T.astype(np.float32)
     except Exception:
-        uq = np.linspace(0.0, 1.0, curve_points, dtype=np.float32)
         curve = np.empty((curve_points, 3), dtype=np.float32)
         for i in range(3):
             curve[:, i] = np.interp(uq, s / total, pts[:, i])
+
+    # Make curvature effect explicit and sensitive: blend spline with straight
+    # endpoint chord. Lower curvature preserves less bending.
+    line = pts[0][None, :] * (1.0 - uq[:, None]) + pts[-1][None, :] * uq[:, None]
+    curve = line + curv * (curve - line)
 
     curve[0] = pts[0]
     curve[-1] = pts[-1]
@@ -893,63 +905,79 @@ def estimate_tangents(points_xyz: np.ndarray, dominant_dir: Optional[np.ndarray]
 # ==============================
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Fiber tracking in cryo-ET tomograms: Sato vesselness → candidate segments → directional merging → .star output.")
-    parser.add_argument("--tomo", required=True, help="input tomogram .mrc path (dark tubes)")
-    parser.add_argument("--voxel-size", type=float, required=True, help="voxel size in Angstrom (required)")
-    parser.add_argument("--bin", type=int, default=2, help="integer binning factor (default 2)")
+def _looks_like_regex_path(path_pattern: str) -> bool:
+    """Heuristic to detect regex-like path patterns."""
+    # Typical regex tokens that are not plain filename characters.
+    return bool(re.search(r"(\\.|\\d|\\D|\\w|\\W|\\s|\\S|[\^\$\+\?\|\(\)\[\]\{\}])", path_pattern))
 
-    # Butterworth preprocessing
-    parser.add_argument("--butterworth-cutoff", type=float, default=200.0, help="Butterworth low-pass cutoff (Angstrom, default 200)")
 
-    # Membrane detection
-    parser.add_argument("--sheetness-percentile", type=float, default=94.0, help="percentile threshold for membrane sheetness (default 90)")
-    parser.add_argument("--min-membrane-voxels", type=int, default=10000, help="minimum voxels for membrane cleaning (default 10000)")
-    parser.add_argument("--min-inplane-width", type=int, default=20, help="minimum inplane width for membrane cleaning (default 20 voxels)")
+def _resolve_regex_matches(path_pattern: str) -> List[Path]:
+    """Resolve files by regex basename under a literal parent directory."""
+    raw = Path(path_pattern).expanduser()
+    parent_raw = raw.parent
+    name_pattern = raw.name
+    parent_dir = (parent_raw if parent_raw.is_absolute() else (Path.cwd() / parent_raw)).resolve()
 
-    # Vesselness parameters
-    parser.add_argument("--sigma-min", type=float, default=4.0, help="minimum sigma (pixels after binning) for multi-scale vesselness (default 4)")
-    parser.add_argument("--sigma-max", type=float, default=8.0, help="maximum sigma (pixels after binning) for multi-scale vesselness (default 8)")
-    parser.add_argument("--sigma-steps", type=int, default=4, help="number of sigma scales (default 4)")
+    if not parent_dir.exists() or not parent_dir.is_dir():
+        raise SystemExit(f"error: regex parent directory not found: {parent_dir}")
+    try:
+        name_re = re.compile(name_pattern)
+    except re.error as exc:
+        raise SystemExit(f"error: invalid regex in --tomo: {exc}")
 
-    # Candidate segment extraction
-    parser.add_argument("--vesselness-percentile", type=float, default=80.0, help="percentile threshold on vesselness for binary mask (default 80)")
-    parser.add_argument("--opening-radius", type=int, default=6, help="ball radius for binary opening to disconnect noise bridges (default 6)")
-    parser.add_argument("--min-fiber-voxels", type=int, default=10000, help="minimum voxel count for candidate CCs (default 10000)")
-    parser.add_argument("--skel-bridge-radius", type=int, default=3, help="dilation radius to bridge skeleton gaps before size filtering (default 3)")
-    parser.add_argument("--direction-filter-angle", type=float, default=45.0, help="max angle from dominant fiber direction (degrees, default 45; >=90 disables)")
-    parser.add_argument("--ref-vesselness-percentile", type=float, default=95.0, help="vesselness percentile for reference mask used to determine dominant fiber direction (default 95; auto-lowers by 2 until >= 3 CCs found)")
+    return [p.resolve() for p in parent_dir.rglob("*.mrc") if name_re.fullmatch(p.name)]
 
-    # Segment merging (Struwwel-Tracer-inspired)
-    parser.add_argument("--merge-gap", type=float, default=500.0, help="max gap for segment merging (Angstrom, default 400)")
-    parser.add_argument("--merge-angle", type=float, default=45.0, help="max angle deviation for segment merging (degrees, default 45)")
-    parser.add_argument("--merge-extend", type=float, default=100.0, help="virtual extension at endpoints for gap bridging (Angstrom, default 100)")
-    parser.add_argument("--min-fiber-length", type=float, default=400.0, help="minimum fiber arc length after merging (Angstrom, default 400)")
 
-    # Output
-    parser.add_argument("--spacing", type=float, default=40.0, help="particle sampling spacing along fibers (Angstrom, default 40)")
-    parser.add_argument("--out-prefix", default=None, help="output file prefix")
-    parser.add_argument("--debug", action="store_true", help="enable debug intermediate outputs")
+def _resolve_tomogram_paths(tomo_arg: str, recursive: bool) -> List[Path]:
+    """Resolve input tomogram paths from single path / glob / regex."""
+    raw = Path(tomo_arg).expanduser()
+    if not recursive:
+        tomo_path = (raw if raw.is_absolute() else (Path.cwd() / raw)).resolve()
+        if not tomo_path.exists():
+            raise SystemExit(f"error: tomogram not found: {tomo_path}")
+        if not tomo_path.is_file():
+            raise SystemExit(f"error: --tomo must be a file when --recursive is not set: {tomo_path}")
+        return [tomo_path]
 
-    args = parser.parse_args()
+    # Recursive mode:
+    # 1) wildcard path (e.g. test/cilia_*.mrc)
+    # 2) regex path (e.g. test/cilia_\d+\.mrc)
+    # 3) directory path (scan all *.mrc recursively)
+    # 4) single file path
+    if has_magic(tomo_arg):
+        pattern = str(raw if raw.is_absolute() else (Path.cwd() / raw))
+        matched = [Path(p).resolve() for p in glob(pattern, recursive=False)]
+    elif _looks_like_regex_path(tomo_arg):
+        matched = _resolve_regex_matches(tomo_arg)
+    else:
+        target = (raw if raw.is_absolute() else (Path.cwd() / raw)).resolve()
+        if target.is_dir():
+            matched = [p.resolve() for p in target.rglob("*.mrc")]
+        elif target.exists():
+            matched = [target]
+        else:
+            raise SystemExit(f"error: tomogram path not found: {target}")
 
-    voxel = float(args.voxel_size)
-    if voxel <= 0:
-        print("error: --voxel-size must be > 0")
-        return
+    paths = sorted(matched)
+    if not paths:
+        raise SystemExit(f"error: no matched files found for --tomo={tomo_arg} with --recursive")
+    return paths
 
-    tomo_path = Path(args.tomo).resolve()
-    if not tomo_path.exists():
-        raise SystemExit(f"error: tomogram not found: {tomo_path}")
 
-    out_prefix: Path
+def _resolve_out_prefix(args: argparse.Namespace, tomo_path: Path, multi_mode: bool) -> Path:
+    """Build output prefix for one tomogram."""
     if args.out_prefix is not None:
         out_prefix = Path(args.out_prefix)
         if not out_prefix.is_absolute():
             out_prefix = tomo_path.parent / out_prefix
-    else:
-        out_prefix = tomo_path.parent / tomo_path.stem
+        if multi_mode:
+            out_prefix = out_prefix.with_name(f"{out_prefix.name}_{tomo_path.stem}")
+        return out_prefix
+    return tomo_path.parent / tomo_path.stem
 
+
+def _process_single_tomogram(args: argparse.Namespace, tomo_path: Path, out_prefix: Path) -> None:
+    voxel = float(args.voxel_size)
     # ---- Load ----
     print(f"loading tomogram: {tomo_path}")
     vol = load_mrc(tomo_path)
@@ -1018,7 +1046,7 @@ def main() -> None:
     base_pct = float(args.vesselness_percentile)
     dominant_dir = None
     while ref_pct > base_pct:
-        print(f"  extracting reference mask (percentile={ref_pct:.1f})")
+        print(f"  extracting reference mask (sheetness_percentile = {ref_pct:.1f}%)")
         ref_mask = extract_binary_mask(
             vess, nonmembrane_mask,
             vesselness_percentile=ref_pct,
@@ -1097,7 +1125,8 @@ def main() -> None:
     for idx, fiber in enumerate(fibers):
         arc_len = float(np.sum(np.linalg.norm(np.diff(fiber, axis=0), axis=1)))
         curve_pts = max(20, int(arc_len / 3.0))
-        smoothed = smooth_curve(fiber, curve_points=curve_pts, curvature=0.3)
+        curv = float(np.clip(args.curvature, 0.0, 1.0))
+        smoothed = smooth_curve(fiber, curve_points=curve_pts, curvature=curv)
 
         pts = resample_curve_by_spacing(smoothed, spacing_px=spacing_px)
         if len(pts) == 0:
@@ -1119,6 +1148,71 @@ def main() -> None:
         star_path = out_prefix.with_name(out_prefix.name + "_particles.star")
         write_star(star_path, coords, angles)
         print(f"saved {len(coords)} particles in {star_path}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Fiber tracking in cryo-ET tomograms: Sato vesselness → candidate segments → directional merging → .star output.")
+    parser.add_argument("--tomo", required=True, help="input .mrc path; with --recursive supports glob (test/cilia_*.mrc) or regex basename (test/cilia_\\d+\\.mrc)")
+    parser.add_argument("--recursive", action="store_true", help="process multiple tomograms (wildcard or directory) recursively")
+    parser.add_argument("--voxel-size", type=float, required=True, help="voxel size in Angstrom (required)")
+    parser.add_argument("--bin", type=int, default=2, help="integer binning factor (default 2)")
+    # Butterworth preprocessing
+    parser.add_argument("--butterworth-cutoff", type=float, default=200.0, help="Butterworth low-pass cutoff (Angstrom, default 200)")
+    # Membrane detection
+    parser.add_argument("--sheetness-percentile", type=float, default=94.0, help="percentile threshold for membrane sheetness (default 90)")
+    parser.add_argument("--min-membrane-voxels", type=int, default=10000, help="minimum voxels for membrane cleaning (default 10000)")
+    parser.add_argument("--min-inplane-width", type=int, default=20, help="minimum inplane width for membrane cleaning (default 20 voxels)")
+    # Vesselness parameters
+    parser.add_argument("--sigma-min", type=float, default=4.0, help="minimum sigma (pixels after binning) for multi-scale vesselness (default 4)")
+    parser.add_argument("--sigma-max", type=float, default=8.0, help="maximum sigma (pixels after binning) for multi-scale vesselness (default 8)")
+    parser.add_argument("--sigma-steps", type=int, default=4, help="number of sigma scales (default 4)")
+    # Candidate segment extraction
+    parser.add_argument("--vesselness-percentile", type=float, default=80.0, help="percentile threshold on vesselness for binary mask (default 80)")
+    parser.add_argument("--opening-radius", type=int, default=6, help="ball radius for binary opening to disconnect noise bridges (default 6)")
+    parser.add_argument("--min-fiber-voxels", type=int, default=10000, help="minimum voxel count for candidate CCs (default 10000)")
+    parser.add_argument("--skel-bridge-radius", type=int, default=3, help="dilation radius to bridge skeleton gaps before size filtering (default 3)")
+    parser.add_argument("--direction-filter-angle", type=float, default=45.0, help="max angle from dominant fiber direction (degrees, default 45; >=90 disables)")
+    parser.add_argument("--ref-vesselness-percentile", type=float, default=95.0, help="vesselness percentile for reference mask used to determine dominant fiber direction (default 95; auto-lowers by 2 until >= 3 CCs found)")
+    # Segment merging (Struwwel-Tracer-inspired)
+    parser.add_argument("--merge-gap", type=float, default=500.0, help="max gap for segment merging (Angstrom, default 400)")
+    parser.add_argument("--merge-angle", type=float, default=45.0, help="max angle deviation for segment merging (degrees, default 45)")
+    parser.add_argument("--merge-extend", type=float, default=100.0, help="virtual extension at endpoints for gap bridging (Angstrom, default 100)")
+    parser.add_argument("--min-fiber-length", type=float, default=400.0, help="minimum fiber arc length after merging (Angstrom, default 400)")
+    # Output
+    parser.add_argument("--curvature", type=float, default=0.2, help="curve bending control [0,1]: 0=straight endpoint line, 1=full spline shape (default 0.2)")
+    parser.add_argument("--spacing", type=float, default=40.0, help="particle sampling spacing along fibers (Angstrom, default 40)")
+    parser.add_argument("--out-prefix", default=None, help="output file prefix")
+    parser.add_argument("--debug", action="store_true", help="enable debug intermediate outputs")
+    args = parser.parse_args()
+
+    if float(args.voxel_size) <= 0:
+        print("error: --voxel-size must be > 0")
+        return
+
+    tomo_paths = _resolve_tomogram_paths(args.tomo, recursive=bool(args.recursive))
+    multi_mode = len(tomo_paths) > 1
+
+    if multi_mode:
+        print(f"matched {len(tomo_paths)} tomograms for processing")
+        if args.out_prefix is not None:
+            print("note: --out-prefix is automatically suffixed by each tomogram stem in multi-file mode")
+
+    n_ok = 0
+    n_fail = 0
+    time_start = time.time()
+    for idx, tomo_path in enumerate(tomo_paths, 1):
+        print("=" * 88)
+        print(f"[{idx}/{len(tomo_paths)}] processing: {tomo_path}")
+        out_prefix = _resolve_out_prefix(args, tomo_path, multi_mode=multi_mode)
+        try:
+            _process_single_tomogram(args, tomo_path, out_prefix)
+            n_ok += 1
+        except Exception as exc:
+            n_fail += 1
+            print(f"error while processing {tomo_path}: {exc}")
+
+    print("=" * 88)
+    print(f"done: {n_ok} succeeded, {n_fail} failed, in {time.time() - time_start:.2f}s")
 
 
 if __name__ == "__main__":
