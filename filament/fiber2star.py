@@ -22,10 +22,10 @@ Pipeline
   7. Skeletonize (CPU)       : 3D thinning → bridge micro-gaps → re-skeletonize
   8. Junction split + filter : break at branch-points → keep branches aligned with
                                dominant direction
-  9. Segment merging         : greedy nearest-endpoint merge (gap + angle check)
- 10. Length filter
- 11. Line-fit + sample       : nearly-straight fibers → PCA line → evenly spaced pts
- 12. Write .star              : rlnCoordinateX/Y/Z + rlnAngleRot/Tilt/Psi
+  9. Greedy spline extraction: choose best B-spline fiber candidate globally
+ 10. Spatial erase           : remove all candidate segments within radius-R cylinder
+ 11. Iterate                 : repeat best-fit + erase until candidates are exhausted
+ 12. Sample + write .star     : rlnCoordinateX/Y/Z + rlnAngleRot/Tilt/Psi
 ────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
@@ -46,15 +46,14 @@ import math
 import re
 import time
 import traceback
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
 import mrcfile
 import starfile
 from scipy.spatial.transform import Rotation as R
-from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import connected_components as _sp_cc
+from scipy.interpolate import splprep, splev
 
 import cupy as cp
 from cupyx.scipy.ndimage import gaussian_filter1d as cp_gaussian1d
@@ -62,7 +61,6 @@ from cupyx.scipy.ndimage import convolve as cp_convolve
 from cucim import skimage as cskimage
 
 from skimage.morphology import skeletonize  # not yet in cucim
-from skimage import io as skio
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -573,269 +571,313 @@ def skeleton_to_segments(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 7b (replaces merge): lateral-proximity clustering of segments
+# Step 7b: Greedy B-spline extraction with spatial erase
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def group_segments_by_fiber(
-    segments: List[np.ndarray],
+def _safe_unit(v: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    nv = float(np.linalg.norm(v))
+    if not np.isfinite(nv) or nv < 1e-8:
+        return fallback.copy()
+    return (v / nv).astype(np.float64)
+
+
+def _polyline_arc_length(pts_xyz: np.ndarray) -> float:
+    if len(pts_xyz) < 2:
+        return 0.0
+    d = np.diff(pts_xyz.astype(np.float64), axis=0)  # np.diff 得到相邻段向量。
+    return float(np.sum(np.linalg.norm(d, axis=1)))  # 每段求欧氏长度并求和 = 折线总弧长。
+
+
+def _segment_dir(seg_xyz: np.ndarray, dominant_dir: np.ndarray) -> np.ndarray:
+    seg = seg_xyz.astype(np.float64)
+    if len(seg) >= 3:
+        try:
+            _, _, vh = np.linalg.svd(seg - seg.mean(0), full_matrices=False)
+            d = _safe_unit(vh[0], dominant_dir)  # 优先用 SVD 的第一主轴 vh[0] 作为方向。
+        except Exception:
+            d = _safe_unit(seg[-1] - seg[0], dominant_dir)
+    else:
+        d = _safe_unit(seg[-1] - seg[0], dominant_dir)
+    if float(np.dot(d, dominant_dir)) < 0.0:
+        d = -d  # 确保方向与 dominant_dir 同向。
+    return d
+
+
+def _orient_segment_along(seg_xyz: np.ndarray, dominant_dir: np.ndarray) -> np.ndarray:
+    seg = seg_xyz.astype(np.float64)
+    if len(seg) < 2:
+        return seg
+    p = seg @ dominant_dir  # 计算 segment 起点到终点沿 dominant_dir 方向的投影长度。
+    if p[-1] < p[0]:
+        seg = seg[::-1]  # 如果终点在前，起点在后，则反转 segment。
+    return seg
+
+
+def _stitch_chain_points(chain: List[int], segments: List[np.ndarray], dominant_dir: np.ndarray) -> np.ndarray:
+    if not chain:
+        return np.empty((0, 3), dtype=np.float64)
+    pts_list: List[np.ndarray] = []
+    for idx in chain:
+        pts_list.append(_orient_segment_along(segments[idx], dominant_dir))  # 将每个 segment 沿 dominant_dir 方向排列。
+    pts = np.vstack(pts_list)
+    pts = pts[np.argsort(pts @ dominant_dir)]  # 按投影长度排序。
+    keep = [0]
+    for i in range(1, len(pts)):
+        if np.linalg.norm(pts[i] - pts[keep[-1]]) >= 0.7:  # 如果当前点与上一个保留点距离 >= 0.7，则保留。
+            keep.append(i)
+    if keep[-1] != len(pts) - 1:
+        keep.append(len(pts) - 1)
+    return pts[keep].astype(np.float64)
+
+
+def _sample_volume_nn(vol_zyx: np.ndarray, pts_xyz: np.ndarray) -> np.ndarray:
+    """Sample volume values at given points using nearest neighbor interpolation."""
+    if len(pts_xyz) == 0:
+        return np.empty((0,), dtype=np.float64)
+    z = np.clip(np.round(pts_xyz[:, 2]).astype(np.int64), 0, vol_zyx.shape[0] - 1)
+    y = np.clip(np.round(pts_xyz[:, 1]).astype(np.int64), 0, vol_zyx.shape[1] - 1)
+    x = np.clip(np.round(pts_xyz[:, 0]).astype(np.int64), 0, vol_zyx.shape[2] - 1)
+    return vol_zyx[z, y, x].astype(np.float64)
+
+
+def _fit_bspline_curve(
+    pts_xyz: np.ndarray,
+    smoothness: float,
+    min_eval: int = 40,
+) -> Tuple[np.ndarray, float, float]:
+    """Fit a 3D B-spline curve and return: (curve points, bending energy, curvature CV)."""
+    pts = np.asarray(pts_xyz, dtype=np.float64)
+    if len(pts) < 4:
+        return pts.astype(np.float32), 0.0, 0.0
+    try:
+        k = min(3, len(pts) - 1) # 最大三次样条。
+        s = max(float(smoothness), 0.0) * float(len(pts))  # 平滑因子：越大越平滑。
+        tck, _ = splprep([pts[:, 0], pts[:, 1], pts[:, 2]], s=s, k=k)
+        n_eval = max(min_eval, len(pts) * 3)  # 采样点数：至少 min_eval，但不超过点数的三倍。
+        u = np.linspace(0.0, 1.0, n_eval)  # 均匀采样弧长参数。
+        x, y, z = splev(u, tck)  # 计算 B-spline 曲线。
+        curve = np.stack([x, y, z], axis=1).astype(np.float64)
+
+        d1 = np.stack(splev(u, tck, der=1), axis=1)  # 计算一阶导数。
+        d2 = np.stack(splev(u, tck, der=2), axis=1)  # 计算二阶导数。
+        sp = np.linalg.norm(d1, axis=1)  # 计算一阶导数的模。
+        cross = np.cross(d1, d2)  # 计算曲率。
+        curv = np.linalg.norm(cross, axis=1) / np.maximum(sp ** 3, 1e-8)  # 计算曲率。
+
+        du = 1.0 / max(n_eval - 1, 1)  # 采样步长。
+        ds = sp * du  # 计算弧长。
+        total_len = max(float(np.sum(ds)), 1e-8)  # 总弧长。
+        bending = float(np.sum((curv ** 2) * ds) / total_len)  # 计算弯曲能量，越大越弯曲。
+        curv_mean = float(np.mean(curv))  # 计算曲率均值。
+        curv_cv = float(np.std(curv) / max(curv_mean, 1e-6))  # 计算曲率变异系数，越大变化越大。
+        return curve.astype(np.float32), bending, curv_cv
+    except Exception:
+        return pts.astype(np.float32), 0.0, 0.0
+
+
+def _grow_chain_from_seed(
+    seed_idx: int,
+    active_idxs: List[int],
+    centroids: np.ndarray,
+    seg_dirs: np.ndarray,
+    seg_signals: np.ndarray,
     dominant_dir: np.ndarray,
     fiber_radius_px: float,
+    max_gap_along: float,
+    cos_thr: float,
+) -> List[int]:
+    active_set = set(active_idxs)
+    chain = [seed_idx]
+    used: Set[int] = {seed_idx}
+
+    def _best_next(cur_idx: int, forward: bool) -> Optional[int]:
+        c0 = centroids[cur_idx]
+        d0 = seg_dirs[cur_idx]
+        best = None
+        best_score = -1e18
+        for j in active_set:  # 遍历所有活跃段。
+            if j in used:
+                continue
+            dv = centroids[j] - c0  # 计算当前段与目标段的向量。
+            gap_along = float(np.dot(dv, dominant_dir))  
+            if forward:
+                if gap_along <= 1e-6 or gap_along > max_gap_along:
+                    continue
+            else:
+                if gap_along >= -1e-6 or -gap_along > max_gap_along:
+                    continue
+            lateral = float(np.linalg.norm(dv - gap_along * dominant_dir))  # 计算侧向偏移。
+            if lateral > float(fiber_radius_px):
+                continue
+            gap_norm = float(np.linalg.norm(dv))  # 计算向量模。
+            if gap_norm < 1e-6:
+                continue
+            cos_gap = abs(gap_along) / gap_norm  # 计算连接方向对齐度。
+            if cos_gap < cos_thr:
+                continue
+            if abs(float(np.dot(seg_dirs[j], dominant_dir))) < cos_thr:  # 计算段方向对齐度。
+                continue
+            turn_align = abs(float(np.dot(seg_dirs[j], d0)))
+            score = (
+                2.0 * float(seg_signals[j])  # 信号强度权重。
+                + 50.0 * turn_align  # 段方向对齐权重。
+                + 30.0 * cos_gap  # 连接方向对齐权重。
+                - 1.5 * lateral  # 侧向偏移惩罚。
+                - 0.4 * abs(gap_along)  # 跨距偏移惩罚。
+            )
+            if score > best_score:  # 如果当前分数大于最佳分数，则更新最佳分数和最佳索引。
+                best_score = score
+                best = j  # 更新最佳索引。
+        return best
+
+    cur = seed_idx
+    while True:
+        nxt = _best_next(cur, forward=True)
+        if nxt is None:
+            break
+        chain.append(nxt)
+        used.add(nxt)
+        cur = nxt
+
+    cur = seed_idx
+    head: List[int] = []
+    while True:
+        prv = _best_next(cur, forward=False)
+        if prv is None:
+            break
+        head.append(prv)
+        used.add(prv)
+        cur = prv
+
+    head.reverse()
+    return head + chain
+
+
+def _segment_touches_curve(seg_xyz: np.ndarray, curve_xyz: np.ndarray, radius_px: float) -> bool:
+    """Check if a segment touches a curve within a given radius."""
+    if len(seg_xyz) == 0 or len(curve_xyz) == 0:
+        return False
+    r2 = float(radius_px) * float(radius_px)
+    seg_min = seg_xyz.min(axis=0) - radius_px
+    seg_max = seg_xyz.max(axis=0) + radius_px
+    cur_min = curve_xyz.min(axis=0)
+    cur_max = curve_xyz.max(axis=0)
+    if np.any(seg_max < cur_min) or np.any(cur_max < seg_min):
+        return False
+
+    curve_sub = curve_xyz[::2] if len(curve_xyz) > 120 else curve_xyz # 如果曲线点数大于120，则每隔一个点取一个点。
+    diff = seg_xyz[:, None, :] - curve_sub[None, :, :]
+    d2 = np.sum(diff * diff, axis=2)  # 计算每个点到曲线的距离的平方。
+    return bool(np.any(d2 <= r2))
+
+
+def extract_fibers_by_greedy_bspline(
+    segments: List[np.ndarray],
+    vol_zyx: np.ndarray,
+    dominant_dir: np.ndarray,
+    fiber_radius_px: float,
+    erase_radius_px: float,
+    min_len_px: float,
     max_angle_deg: float = 30.0,
-    debug_prefix: Optional[Path] = None,
+    smoothness: float = 0.4,
+    signal_weight: float = 2.5,
+    bending_weight: float = 0.05,
+    curvature_cv_weight: float = 0.2,
+    min_candidate_score: float = 0.0,
 ) -> List[np.ndarray]:
     """
-    Build fiber chains from noisy skeleton segments with strict constraints:
-      1) lateral distance (in plane ⟂ dominant_dir) <= fiber_radius_px
-      2) forward-only links along dominant_dir
-      3) gap direction must be close to dominant_dir (angle <= max_angle_deg)
-      4) one predecessor + one successor per segment (one-to-one directed graph)
-      5) greedy score prefers long segments first, then directional consistency
+    Iterative greedy extraction:
+      1) evaluate best spline candidate from current segment pool
+      2) erase all segments inside radius-R cylinder around chosen spline
+      3) repeat until no valid candidate remains
     """
     if not segments:
         return []
 
-    d = dominant_dir / np.linalg.norm(dominant_dir)
+    d = np.asarray(dominant_dir, dtype=np.float64)
+    d /= max(float(np.linalg.norm(d)), 1e-8)
     cos_thr = math.cos(math.radians(max_angle_deg))
-    n = len(segments)
-    max_gap_along = max(4.0 * float(fiber_radius_px), 12.0)
-
-    def _safe_unit(v: np.ndarray, fallback: np.ndarray) -> np.ndarray:
-        nv = float(np.linalg.norm(v))
-        if not np.isfinite(nv) or nv < 1e-8:
-            return fallback.copy()
-        return (v / nv).astype(np.float64)
-
-    def _segment_dir(seg: np.ndarray) -> np.ndarray:
-        seg64 = seg.astype(np.float64)
-        if len(seg64) >= 3:
-            try:
-                _, _, vh = np.linalg.svd(seg64 - seg64.mean(0), full_matrices=False)
-                vd = _safe_unit(vh[0], d)
-            except Exception:
-                vd = _safe_unit(seg64[-1] - seg64[0], d)
-        else:
-            vd = _safe_unit(seg64[-1] - seg64[0], d)
-        if float(np.dot(vd, d)) < 0.0:
-            vd = -vd
-        return vd
+    max_gap_along = max(8.0 * float(fiber_radius_px), 12.0)
 
     centroids = np.array([seg.mean(0) for seg in segments], dtype=np.float64)
-    along_c = centroids @ d
-    perp_c = centroids - along_c[:, None] * d
-    seg_dirs = np.array([_segment_dir(seg) for seg in segments], dtype=np.float64)
-    seg_lens = np.array(
-        [float(np.sum(np.linalg.norm(np.diff(seg.astype(np.float64), axis=0), axis=1))) if len(seg) >= 2 else 0.0
-         for seg in segments],
-        dtype=np.float64,
-    )
+    seg_dirs = np.array([_segment_dir(seg, d) for seg in segments], dtype=np.float64)  # 计算每个段的朝向。
+    seg_lens = np.array([_polyline_arc_length(seg) for seg in segments], dtype=np.float64)  # 计算每个段的弧长。
+    seg_signals = np.array([float(_sample_volume_nn(vol_zyx, seg).mean()) for seg in segments], dtype=np.float64)  # 计算每个段的信号强度。
 
-    edges = []
-    for i in range(n):
-        for j in range(n):
-            if i == j:
-                continue
-            dv = centroids[j] - centroids[i]
-            gap_along = float(np.dot(dv, d))
-            if gap_along <= 1e-6 or gap_along > max_gap_along:
-                continue
-            lateral = float(np.linalg.norm(dv - gap_along * d))
-            if lateral > float(fiber_radius_px):
-                continue
-            gap_norm = float(np.linalg.norm(dv))
-            if gap_norm < 1e-6:
-                continue
-            cos_gap = gap_along / gap_norm
-            if cos_gap < cos_thr:
-                continue
-            if abs(float(np.dot(seg_dirs[i], d))) < cos_thr or abs(float(np.dot(seg_dirs[j], d))) < cos_thr:
-                continue
+    active: Set[int] = set(range(len(segments)))
+    fibers: List[np.ndarray] = []  # 存储提取的纤维。
+    iter_idx = 0
 
-            long_priority = min(seg_lens[i], seg_lens[j])
-            score = (
-                5.0 * long_priority
-                + 1.5 * (seg_lens[i] + seg_lens[j])
-                + 100.0 * cos_gap
-                - 2.0 * lateral
-                - 0.75 * gap_along
+    while active:
+        iter_idx += 1
+        active_list = sorted(active)
+        best_score = -1e18
+        best_curve = None
+        best_chain: List[int] = []
+        best_arc = 0.0
+
+        for seed in active_list:
+            chain = _grow_chain_from_seed(
+                seed_idx=seed,
+                active_idxs=active_list,
+                centroids=centroids,
+                seg_dirs=seg_dirs,
+                seg_signals=seg_signals,
+                dominant_dir=d,
+                fiber_radius_px=fiber_radius_px,
+                max_gap_along=max_gap_along,
+                cos_thr=cos_thr,
             )
-            edges.append((score, i, j, gap_along, lateral, cos_gap))
+            if len(chain) == 0:
+                continue
 
-    succ = -np.ones(n, dtype=np.int32)
-    pred = -np.ones(n, dtype=np.int32)
-    chosen_edges: List[Tuple[int, int]] = []
-    for _, i, j, _, _, _ in sorted(edges, key=lambda x: x[0], reverse=True):
-        if succ[i] >= 0 or pred[j] >= 0:
-            continue
-        succ[i] = j
-        pred[j] = i
-        chosen_edges.append((i, j))
+            chain_pts = _stitch_chain_points(chain, segments, d)
+            if len(chain_pts) < 4:
+                continue
+            arc = _polyline_arc_length(chain_pts)
+            if arc < float(min_len_px):
+                continue
 
-    visited = np.zeros(n, dtype=bool)
-    chains: List[List[int]] = []
-    starts = np.where(pred < 0)[0]
-    starts = starts[np.argsort(along_c[starts])]
-    for s in starts:
-        if visited[s]:
-            continue
-        ch = [int(s)]
-        visited[s] = True
-        cur = int(s)
-        while succ[cur] >= 0:
-            nxt = int(succ[cur])
-            if visited[nxt]:
-                break
-            ch.append(nxt)
-            visited[nxt] = True
-            cur = nxt
-        chains.append(ch)
-    for i in range(n):
-        if not visited[i]:
-            chains.append([int(i)])
-            visited[i] = True
+            curve, bending, curv_cv = _fit_bspline_curve(chain_pts, smoothness=smoothness)
+            if len(curve) < 2:
+                continue
+            curve_signal = float(_sample_volume_nn(vol_zyx, curve).mean()) if len(curve) else 0.0
+            chain_strength = float(np.mean(seg_signals[np.asarray(chain, dtype=np.int64)]))
+            chain_len = float(np.sum(seg_lens[np.asarray(chain, dtype=np.int64)]))
+            score = (
+                signal_weight * (0.55 * curve_signal + 0.45 * chain_strength)
+                + 0.05 * chain_len
+                + 0.25 * len(chain)
+                - bending_weight * bending
+                - curvature_cv_weight * curv_cv
+            )
+            if score > best_score:
+                best_score = score
+                best_curve = curve.astype(np.float32)
+                best_chain = chain
+                best_arc = arc
 
-    results: List[np.ndarray] = []
-    seg_to_chain = -np.ones(n, dtype=np.int32)
-    for ci, ch in enumerate(chains):
-        for si in ch:
-            seg_to_chain[si] = int(ci)
+        if best_curve is None or best_score < float(min_candidate_score):
+            break
 
-        ch_perp = perp_c[np.asarray(ch, dtype=np.int32)]
-        ch_center = np.median(ch_perp, axis=0)
-        keep_idxs = []
-        for si in ch:
-            if float(np.linalg.norm(perp_c[si] - ch_center)) <= float(fiber_radius_px):
-                keep_idxs.append(si)
-        if not keep_idxs:
-            continue
+        fibers.append(best_curve)
+        erased = 0
+        for idx in list(active):
+            # 如果当前段在最佳链中或与最佳曲线相交，则删除当前段。
+            if idx in best_chain or _segment_touches_curve(segments[idx].astype(np.float64), best_curve.astype(np.float64), erase_radius_px):
+                active.remove(idx)
+                erased += 1
 
-        chain_pts: List[np.ndarray] = []
-        for si in keep_idxs:
-            seg = segments[si].astype(np.float64)
-            p = seg @ d
-            seg_sorted = seg[np.argsort(p)]
-            if chain_pts:
-                prev = chain_pts[-1][-1]
-                if np.linalg.norm(seg_sorted[0] - prev) > np.linalg.norm(seg_sorted[-1] - prev):
-                    seg_sorted = seg_sorted[::-1]
-            chain_pts.append(seg_sorted)
-
-        pts = np.vstack(chain_pts)
-        p_all = pts @ d
-        pts = pts[np.argsort(p_all)]
-        dedup = [0]
-        for k in range(1, len(pts)):
-            if np.linalg.norm(pts[k] - pts[dedup[-1]]) >= 0.8:
-                dedup.append(k)
-        if dedup[-1] != len(pts) - 1:
-            dedup.append(len(pts) - 1)
-        pts = pts[dedup]
-        if len(pts) >= 2:
-            results.append(pts.astype(np.float32))
-
-    if debug_prefix is not None:
-        _save_cluster_debug_2d(
-            centroids=centroids,
-            dominant_dir=d,
-            chain_ids=seg_to_chain,
-            edges=chosen_edges,
-            seg_lens=seg_lens,
-            out_png=debug_prefix.parent / (debug_prefix.name + "_9_clustered_2d.png"),
+        print(
+            f"  greedy iter {iter_idx:02d}: chain={len(best_chain)} seg, "
+            f"arc={best_arc:.1f}px, score={best_score:.3f}, erased={erased}, remain={len(active)}"
         )
-    return results
-
-
-def _save_cluster_debug_2d(
-    centroids: np.ndarray,
-    dominant_dir: np.ndarray,
-    chain_ids: np.ndarray,
-    edges: List[Tuple[int, int]],
-    seg_lens: np.ndarray,
-    out_png: Path,
-) -> None:
-    """
-    Save 2D clustering diagnostics in plane perpendicular to dominant direction.
-    Each segment centroid is color-coded by chain ID; chosen directed links are drawn.
-    """
-    if len(centroids) == 0:
-        return
-
-    d = dominant_dir.astype(np.float64)
-    d = d / np.linalg.norm(d)
-
-    # Use projected +Z as image Y axis (as close as possible to tomogram Z).
-    z_axis = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    v = z_axis - float(np.dot(z_axis, d)) * d
-    if float(np.linalg.norm(v)) < 1e-6:
-        y_axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        v = y_axis - float(np.dot(y_axis, d)) * d
-    v /= max(float(np.linalg.norm(v)), 1e-8)
-    u = np.cross(v, d)
-    u /= max(float(np.linalg.norm(u)), 1e-8)
-
-    uv = np.stack([centroids @ u, centroids @ v], axis=1)
-    uv_min = uv.min(axis=0)
-    uv_max = uv.max(axis=0)
-    span = np.maximum(uv_max - uv_min, 1.0)
-
-    pad = 40
-    max_canvas = 1400.0
-    scale = (max_canvas - 2.0 * pad) / max(float(max(span[0], span[1])), 1.0)
-    w = int(max(2 * pad + 20, round(span[0] * scale + 2 * pad)))
-    h = int(max(2 * pad + 20, round(span[1] * scale + 2 * pad)))
-    xy = np.empty_like(uv)
-    # Flip both axes to match tomogram viewer orientation expectations.
-    xy[:, 0] = pad + (uv_max[0] - uv[:, 0]) * scale
-    xy[:, 1] = pad + (uv_max[1] - uv[:, 1]) * scale
-
-    img = np.full((h, w, 3), 255, dtype=np.uint8)
-
-    def _draw_disk(cx: int, cy: int, rad: int, color: np.ndarray) -> None:
-        r = max(1, int(rad))
-        y0, y1 = max(0, cy - r), min(h - 1, cy + r)
-        x0, x1 = max(0, cx - r), min(w - 1, cx + r)
-        yy, xx = np.mgrid[y0:y1 + 1, x0:x1 + 1]
-        m = (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
-        img[yy[m], xx[m]] = color
-
-    def _draw_line(x0: float, y0: float, x1: float, y1: float, color: np.ndarray) -> None:
-        dist = max(abs(x1 - x0), abs(y1 - y0))
-        n_step = max(int(dist) + 1, 2)
-        for t in np.linspace(0.0, 1.0, n_step):
-            x = int(round(x0 + t * (x1 - x0)))
-            y = int(round(y0 + t * (y1 - y0)))
-            if 0 <= x < w and 0 <= y < h:
-                img[y, x] = color
-
-    # Draw selected links first
-    for i, j in edges:
-        _draw_line(xy[i, 0], xy[i, 1], xy[j, 0], xy[j, 1], np.array([90, 90, 90], dtype=np.uint8))
-
-    n_chain = int(np.max(chain_ids)) + 1 if len(chain_ids) else 0
-    rng = np.random.default_rng(12345)
-    palette = rng.integers(25, 235, size=(max(n_chain, 1), 3), dtype=np.uint8)
-
-    q50 = float(np.percentile(seg_lens, 50)) if len(seg_lens) else 1.0
-    q95 = float(np.percentile(seg_lens, 95)) if len(seg_lens) else max(q50, 1.0)
-    denom = max(q95 - q50, 1e-6)
-
-    for i in range(len(centroids)):
-        cid = int(chain_ids[i])
-        if cid < 0:
-            color = np.array([0, 0, 0], dtype=np.uint8)
-        else:
-            color = palette[cid % len(palette)]
-        r = 2 + int(np.clip((seg_lens[i] - q50) / denom, 0.0, 1.0) * 5.0)
-        _draw_disk(int(round(xy[i, 0])), int(round(xy[i, 1])), r, color)
-
-    try:
-        skio.imsave(str(out_png), img)
-    except Exception as e:
-        print(f"  warn: failed saving cluster 2D debug image: {e}")
+    return fibers
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Steps 9: Line-fit sampling + Euler angles
+# Step 8: Sampling + Euler angles
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -843,81 +885,168 @@ def fit_line_and_sample(
     segment_xyz: np.ndarray,
     dominant_dir: np.ndarray,
     spacing_px: float,
+    pre_smoothed: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Smooth polyline arc-length sampling for a fiber track.
+    Fit a mild-curvature centerline and resample by arc length.
+    Unlike direct polyline interpolation, this does not need to pass each local
+    segment point, which helps suppress over-bending from skeleton jitter.
     Returns (coords (N,3) float32 xyz, global_dir (3,) float32 xyz).
     """
+    def _unit(v: np.ndarray) -> np.ndarray:
+        nv = float(np.linalg.norm(v))
+        if nv < 1e-8 or not np.isfinite(nv):
+            return np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        return v / nv
+
+    def _resample_polyline(poly: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if len(poly) == 0:
+            d0 = _unit(np.asarray(dominant_dir, dtype=np.float64))
+            return np.empty((0, 3), dtype=np.float32), d0.astype(np.float32)
+        if len(poly) == 1:
+            d0 = _unit(np.asarray(dominant_dir, dtype=np.float64))
+            return poly.astype(np.float32), d0.astype(np.float32)
+
+        seg_vec = np.diff(poly, axis=0)
+        seg_len = np.linalg.norm(seg_vec, axis=1)
+        cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+        total_len = float(cum[-1])
+        if total_len < max(spacing_px * 0.5, 1e-6):
+            mid = poly.mean(0, keepdims=True)
+            d = _unit(poly[-1] - poly[0])
+            if float(np.dot(d, dominant_dir)) < 0:
+                d = -d
+            return mid.astype(np.float32), d.astype(np.float32)
+
+        n_pts = max(2, int(round(total_len / spacing_px)) + 1)
+        ts = np.linspace(0.0, total_len, n_pts)
+        out = np.empty((n_pts, 3), dtype=np.float64)
+        j = 0
+        for k, t in enumerate(ts):
+            while j + 1 < len(cum) and cum[j + 1] < t:
+                j += 1
+            if j + 1 >= len(cum):
+                out[k] = poly[-1]
+                continue
+            den = max(cum[j + 1] - cum[j], 1e-8)
+            a = (t - cum[j]) / den
+            out[k] = (1.0 - a) * poly[j] + a * poly[j + 1]
+
+        gd = _unit(out[-1] - out[0])
+        if float(np.dot(gd, dominant_dir)) < 0:
+            gd = -gd
+        return out.astype(np.float32), gd.astype(np.float32)
+
     pts = np.asarray(segment_xyz, dtype=np.float64)
     if len(pts) == 0:
-        d0 = np.asarray(dominant_dir, dtype=np.float64)
-        d0 /= max(np.linalg.norm(d0), 1e-8)
+        d0 = _unit(np.asarray(dominant_dir, dtype=np.float64))
         return np.empty((0, 3), dtype=np.float32), d0.astype(np.float32)
 
-    # Deduplicate tiny spatial repeats to avoid zero-length arc segments.
+    # Deduplicate tiny spatial repeats.
     keep = [0]
     for i in range(1, len(pts)):
         if np.linalg.norm(pts[i] - pts[keep[-1]]) >= 1e-6:
             keep.append(i)
     pts = pts[keep]
-    if len(pts) == 1:
-        d0 = np.asarray(dominant_dir, dtype=np.float64)
-        d0 /= max(np.linalg.norm(d0), 1e-8)
-        return pts.astype(np.float32), d0.astype(np.float32)
+    if len(pts) < 4:
+        return _resample_polyline(pts)
 
-    # Lightweight smoothing to suppress jagged NN skeleton oscillation.
-    win = min(7, len(pts) if len(pts) % 2 == 1 else len(pts) - 1)
-    if win >= 3:
-        r = win // 2
-        sm = np.zeros_like(pts)
-        for i in range(len(pts)):
-            s = max(0, i - r)
-            e = min(len(pts), i + r + 1)
-            sm[i] = pts[s:e].mean(0)
-        pts_smooth = sm
-    else:
+    # Mild smoothing for noisy raw polylines before model fitting.
+    if pre_smoothed:
         pts_smooth = pts
+    else:
+        win = min(7, len(pts) if len(pts) % 2 == 1 else len(pts) - 1)
+        if win >= 3:
+            r = win // 2
+            sm = np.zeros_like(pts)
+            for i in range(len(pts)):
+                s = max(0, i - r)
+                e = min(len(pts), i + r + 1)
+                sm[i] = pts[s:e].mean(0)
+            pts_smooth = sm
+        else:
+            pts_smooth = pts
 
-    # Arc-length parameterization and uniform sampling.
-    seg_vec = np.diff(pts_smooth, axis=0)
-    seg_len = np.linalg.norm(seg_vec, axis=1)
-    cum = np.concatenate([[0.0], np.cumsum(seg_len)])
-    total_len = float(cum[-1])
-    if total_len < max(spacing_px * 0.5, 1e-6):
-        mid = pts_smooth.mean(0, keepdims=True)
-        v = pts_smooth[-1] - pts_smooth[0]
-        nv = float(np.linalg.norm(v))
-        if nv < 1e-8:
-            v = np.asarray(dominant_dir, dtype=np.float64)
-            nv = max(float(np.linalg.norm(v)), 1e-8)
-        d = v / nv
-        if float(np.dot(d, dominant_dir)) < 0:
-            d = -d
-        return mid.astype(np.float32), d.astype(np.float32)
+    # Build local frame: d (dominant), u/v (perpendicular).
+    d = _unit(np.asarray(dominant_dir, dtype=np.float64))
+    ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(float(np.dot(ref, d))) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    u = _unit(ref - float(np.dot(ref, d)) * d)
+    v = _unit(np.cross(d, u))
 
-    n_pts = max(2, int(round(total_len / spacing_px)) + 1)
-    ts = np.linspace(0.0, total_len, n_pts)
-    out = np.empty((n_pts, 3), dtype=np.float64)
-    j = 0
-    for k, t in enumerate(ts):
-        while j + 1 < len(cum) and cum[j + 1] < t:
-            j += 1
-        if j + 1 >= len(cum):
-            out[k] = pts_smooth[-1]
+    origin = pts_smooth.mean(axis=0)
+    rel = pts_smooth - origin[None, :]
+    t = rel @ d
+    tu = rel @ u
+    tv = rel @ v
+    span = float(np.max(t) - np.min(t))
+    if span < 2.0:
+        return _resample_polyline(pts_smooth)
+
+    # Bin/aggregate to avoid fitting every local jitter point.
+    n_bins = min(24, max(6, len(t) // 8))
+    edges = np.linspace(float(np.min(t)), float(np.max(t)), n_bins + 1)
+    tb, ub, vb = [], [], []
+    for bi in range(n_bins):
+        if bi < n_bins - 1:
+            m = (t >= edges[bi]) & (t < edges[bi + 1])
+        else:
+            m = (t >= edges[bi]) & (t <= edges[bi + 1])
+        if not np.any(m):
             continue
-        den = max(cum[j + 1] - cum[j], 1e-8)
-        a = (t - cum[j]) / den
-        out[k] = (1.0 - a) * pts_smooth[j] + a * pts_smooth[j + 1]
+        tb.append(float(np.median(t[m])))
+        ub.append(float(np.median(tu[m])))
+        vb.append(float(np.median(tv[m])))
 
-    global_dir = out[-1] - out[0]
-    ng = float(np.linalg.norm(global_dir))
-    if ng < 1e-8:
-        global_dir = np.asarray(dominant_dir, dtype=np.float64)
-        ng = max(float(np.linalg.norm(global_dir)), 1e-8)
-    global_dir /= ng
-    if float(np.dot(global_dir, dominant_dir)) < 0:
-        global_dir = -global_dir
-    return out.astype(np.float32), global_dir.astype(np.float32)
+    if len(tb) < 4:
+        return _resample_polyline(pts_smooth)
+
+    tb = np.asarray(tb, dtype=np.float64)
+    ub = np.asarray(ub, dtype=np.float64)
+    vb = np.asarray(vb, dtype=np.float64)
+
+    t0 = float(np.mean(tb))
+    t_scale = max(float(np.std(tb)), 1.0)
+    ts = (tb - t0) / t_scale
+    A = np.stack([np.ones_like(ts), ts, ts * ts], axis=1)
+
+    # Penalize quadratic term to keep only slight curvature.
+    lam2 = 1.5 if pre_smoothed else 2.0
+    reg = np.diag([1e-6, 1e-4, lam2])
+
+    try:
+        # 2-step robust weighted least squares.
+        w = np.ones(len(tb), dtype=np.float64)
+        coef_u = np.zeros(3, dtype=np.float64)
+        coef_v = np.zeros(3, dtype=np.float64)
+        for _ in range(2):
+            W = np.sqrt(w)[:, None]
+            Aw = A * W
+            uw = ub * np.sqrt(w)
+            vw = vb * np.sqrt(w)
+            coef_u = np.linalg.solve(Aw.T @ Aw + reg, Aw.T @ uw)
+            coef_v = np.linalg.solve(Aw.T @ Aw + reg, Aw.T @ vw)
+            ru = ub - A @ coef_u
+            rv = vb - A @ coef_v
+            rr = np.sqrt(ru * ru + rv * rv)
+            s = max(float(np.median(rr) * 1.4826), 1e-3)
+            w = 1.0 / (1.0 + (rr / (2.5 * s)) ** 2)
+    except Exception:
+        return _resample_polyline(pts_smooth)
+
+    # Evaluate smooth centerline.
+    t_min = float(np.percentile(t, 1))
+    t_max = float(np.percentile(t, 99))
+    n_dense = max(60, int(round((t_max - t_min) * 2.0)))
+    t_grid = np.linspace(t_min, t_max, n_dense)
+    ts_grid = (t_grid - t0) / t_scale
+    G = np.stack([np.ones_like(ts_grid), ts_grid, ts_grid * ts_grid], axis=1)
+    gu = G @ coef_u
+    gv = G @ coef_v
+    curve = origin[None, :] + t_grid[:, None] * d[None, :] + gu[:, None] * u[None, :] + gv[:, None] * v[None, :]
+
+    return _resample_polyline(curve.astype(np.float64))
 
 
 def vector_to_euler_zyz(vec_xyz: np.ndarray) -> Tuple[float, float, float]:
@@ -943,11 +1072,6 @@ def vector_to_euler_zyz(vec_xyz: np.ndarray) -> Tuple[float, float, float]:
             rot_obj = R.from_matrix(np.eye(3) + K * s + (K @ K) * (1 - c))
     ang = rot_obj.as_euler("ZYZ", degrees=True)
     return float(ang[0]), float(ang[1]), float(ang[2])
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Debug visualization
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _draw_segments_to_volume(
@@ -1089,45 +1213,49 @@ def _process_single_tomogram(args: argparse.Namespace, tomo_path: Path, out_pref
     if args.debug:
         save_mrc(out_prefix.parent / (out_prefix.name + "_8_segments.mrc"), _draw_segments_to_volume(segments, vol_shape, radius=2), voxel)
 
-    # ── 7. Lateral-proximity clustering → fiber groups ────────────────────────
+    # ── 7. Greedy B-spline extraction + spatial erase ────────────────────────
     fiber_radius_px = float(args.fiber_diameter) / 2.0 / voxel
-    print(f"fiber clustering: diameter={args.fiber_diameter} Å (radius={fiber_radius_px:.1f} px), angle≤{args.direction_filter_angle}°")
-    fibers = group_segments_by_fiber(
+    erase_radius_px = (
+        float(args.erase_radius) / voxel
+        if float(args.erase_radius) > 0
+        else max(fiber_radius_px * float(args.erase_radius_scale), fiber_radius_px)
+    )
+    min_len_px = max(0.0, float(args.min_fiber_length) / voxel)
+    print(
+        "greedy spline extraction: "
+        f"fiber_radius={fiber_radius_px:.1f}px, erase_radius={erase_radius_px:.1f}px, "
+        f"angle<={args.direction_filter_angle} deg, min_len={min_len_px:.1f}px"
+    )
+    fibers = extract_fibers_by_greedy_bspline(
         segments,
+        vol_zyx=vol,
         dominant_dir=dominant_dir,
         fiber_radius_px=fiber_radius_px,
+        erase_radius_px=erase_radius_px,
+        min_len_px=min_len_px,
         max_angle_deg=args.direction_filter_angle,
-        debug_prefix=out_prefix if args.debug else None,
+        smoothness=args.spline_smoothness,
+        signal_weight=args.signal_weight,
+        bending_weight=args.bending_weight,
+        curvature_cv_weight=args.curvature_consistency_weight,
+        min_candidate_score=args.min_candidate_score,
     )
-    print(f"  {len(segments)} segments → {len(fibers)} fiber clusters")
+    print(f"  {len(segments)} segments → {len(fibers)} extracted fibers")
     if args.debug:
-        save_mrc(out_prefix.parent / (out_prefix.name + "_9_clustered.mrc"), _draw_segments_to_volume(fibers, vol_shape, radius=2, bridge_gaps=True), voxel)
-
-    # ── 8. Length filter ──────────────────────────────────────────────────────
-    if args.min_fiber_length > 0:
-        min_len_px = float(args.min_fiber_length) / voxel
-        fibers_long: List[np.ndarray] = []
-        for fiber in fibers:
-            arc = float(np.sum(np.linalg.norm(np.diff(fiber, axis=0), axis=1)))
-            if arc >= min_len_px:
-                fibers_long.append(fiber)
-        print(f"  length filter (≥{args.min_fiber_length} Å: {len(fibers)} → {len(fibers_long)} fibers")
-        fibers = fibers_long
-        if args.debug:
-            save_mrc(out_prefix.parent / (out_prefix.name + "_10_length_filtered.mrc"), _draw_segments_to_volume(fibers, vol_shape, radius=2, bridge_gaps=True), voxel)
+        save_mrc(out_prefix.parent / (out_prefix.name + "_9_extracted_fibers.mrc"), _draw_segments_to_volume(fibers, vol_shape, radius=2, bridge_gaps=True), voxel)
 
     if not fibers:
         print("no fibers remain; exiting")
         return
 
-    # ── 9. Sample + write STAR ───────────────────────────────────────────────
+    # ── 8. Sample + write STAR ───────────────────────────────────────────────
     spacing_px = float(args.spacing) / voxel
     all_coords: List[np.ndarray] = []
     all_angles: List[np.ndarray] = []
     fallback_dir = dominant_dir if dominant_dir is not None else np.array([1., 0., 0.], np.float32)
 
     for fiber in fibers:
-        pts, line_dir = fit_line_and_sample(fiber, fallback_dir, spacing_px)
+        pts, line_dir = fit_line_and_sample(fiber, fallback_dir, spacing_px, pre_smoothed=True)
         if len(pts) == 0:
             continue
         rot, tilt, psi = vector_to_euler_zyz(line_dir)
@@ -1209,10 +1337,17 @@ def main() -> None:
     p.add_argument("--threshold", type=float, default=252.0, help="threshold for main binary mask (default 252)")
     p.add_argument("--opening-radius", type=int, default=3, help="ball opening radius to remove thin bridges (default 3)")
     p.add_argument("--min-aspect-ratio", type=float, default=2.0, help="minimum length/cross-span aspect ratio for elongation filter (default 2)")
-    p.add_argument("--direction-filter-angle", type=float, default=30.0, help="max angle from dominant fiber direction for branch/CC filtering (default 30°)")
+    p.add_argument("--direction-filter-angle", type=float, default=20.0, help="max angle from dominant fiber direction for branch/CC filtering (default 20°)")
     p.add_argument("--bridge-radius", type=int, default=3, help="dilation radius to bridge skeleton micro-gaps (default 3)")
-    p.add_argument("--fiber-diameter", type=float, default=500.0, help="fiber diameter in Å used as clustering radius (default 500)")
-    p.add_argument("--min-fiber-length", type=float, default=800.0, help="discard fibers shorter than this arc length (Å, default 800)")
+    p.add_argument("--fiber-diameter", type=float, default=500.0, help="fiber diameter in Å used for local neighborhood radius (default 500)")
+    p.add_argument("--erase-radius", type=float, default=-1.0, help="absolute erase radius in Å (default: auto from --erase-radius-scale)")
+    p.add_argument("--erase-radius-scale", type=float, default=1.1, help="erase radius scale relative to fiber radius when --erase-radius<=0")
+    p.add_argument("--min-fiber-length", type=float, default=1000.0, help="minimum arc length in Å for each greedy spline candidate (default 1000)")
+    p.add_argument("--spline-smoothness", type=float, default=1.5, help="B-spline smoothing strength (larger means smoother, default 1.5)")
+    p.add_argument("--signal-weight", type=float, default=15.0, help="weight of signal-confidence term in greedy score (default 15.0)")
+    p.add_argument("--bending-weight", type=float, default=0.05, help="weight of B-spline bending-energy penalty (default 0.05)")
+    p.add_argument("--curvature-consistency-weight", type=float, default=0.2, help="weight of curvature-consistency penalty (default 0.2)")
+    p.add_argument("--min-candidate-score", type=float, default=0.0, help="stop extraction when best candidate score drops below this value")
     p.add_argument("--spacing", type=float, default=40, help="particle sampling spacing along fiber (Å, default 40)")
     p.add_argument("--out-prefix", default=None, help="output filename prefix (default: tomogram stem in same directory)")
     p.add_argument("--debug", action="store_true", help="save intermediate MRC files for each pipeline step")
