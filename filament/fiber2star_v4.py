@@ -1159,7 +1159,7 @@ def main() -> None:
     # Butterworth preprocessing
     parser.add_argument("--butterworth-cutoff", type=float, default=200.0, help="Butterworth low-pass cutoff (Angstrom, default 200)")
     # Membrane detection
-    parser.add_argument("--sheetness-percentile", type=float, default=94.0, help="percentile threshold for membrane sheetness (default 90)")
+    parser.add_argument("--sheetness-percentile", type=float, default=94.0, help="percentile threshold for membrane sheetness (default 94)")
     parser.add_argument("--min-membrane-voxels", type=int, default=10000, help="minimum voxels for membrane cleaning (default 10000)")
     parser.add_argument("--min-inplane-width", type=int, default=20, help="minimum inplane width for membrane cleaning (default 20 voxels)")
     # Vesselness parameters
