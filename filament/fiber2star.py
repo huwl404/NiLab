@@ -90,14 +90,14 @@ def save_mrc(path: Path, data: np.ndarray, voxel_size: float = 1.0) -> None:
             pass
 
 
-def write_star(out_path: Path, coords_xyz: np.ndarray, angles: np.ndarray) -> None:
+def write_star(out_path: Path, coords_xyz: np.ndarray, angles: np.ndarray, shift_z: float = 0) -> None:
     """Write RELION-style particle STAR (pixel coords, ZYZ Euler degrees)."""
     c = np.asarray(coords_xyz, dtype=np.float32)
     a = np.asarray(angles, dtype=np.float32)
     df = pd.DataFrame({
         "rlnCoordinateX": c[:, 0],
         "rlnCoordinateY": c[:, 1],
-        "rlnCoordinateZ": c[:, 2],
+        "rlnCoordinateZ": c[:, 2] + shift_z,
         "rlnAngleRot":    a[:, 0],
         "rlnAngleTilt":   a[:, 1],
         "rlnAnglePsi":    a[:, 2],
@@ -1270,7 +1270,7 @@ def _process_single_tomogram(args: argparse.Namespace, tomo_path: Path, out_pref
     coords = np.vstack(all_coords).astype(np.float32)
     angles = np.vstack(all_angles).astype(np.float32)
     star_path = out_prefix.parent / (out_prefix.name + "_particles.star")
-    write_star(star_path, coords, angles)
+    write_star(star_path, coords, angles, shift_z=args.shift_z)
     print(f"saved {len(coords)} particles → {star_path}  ({time.time()-t0:.1f}s)")
 
 
@@ -1349,6 +1349,7 @@ def main() -> None:
     p.add_argument("--curvature-consistency-weight", type=float, default=0.2, help="weight of curvature-consistency penalty (default 0.2)")
     p.add_argument("--min-candidate-score", type=float, default=0.0, help="stop extraction when best candidate score drops below this value")
     p.add_argument("--spacing", type=float, default=40, help="particle sampling spacing along fiber (Å, default 40)")
+    p.add_argument("--shift-z", type=float, default=0, help="shift along z-axis in the output particles(voxel units, default 0)")
     p.add_argument("--out-prefix", default=None, help="output filename prefix (default: tomogram stem in same directory)")
     p.add_argument("--debug", action="store_true", help="save intermediate MRC files for each pipeline step")
     p.add_argument("--recursive", action="store_true", help="process multiple tomograms (glob/directory)")
