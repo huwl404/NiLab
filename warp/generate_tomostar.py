@@ -72,7 +72,7 @@ def compute_tilt_median_intensities(path: Path, sample_factor: int = 10) -> floa
         return float("nan")
 
 
-def build_angle_sequence(total_row: int, increase: int, flip_after: int, direction: str) -> List[float]:
+def build_angle_sequence(total_row: int, increase: int, flip_after: int, direction: str, csv_not_sym: bool) -> List[float]:
     """
     Build angle list length total_row.
     Pattern: offsets sequence = [0, +1,+2, -1,-2, +3,+4, -3,-4, ...]  (flip_after controls group size)
@@ -102,7 +102,7 @@ def build_angle_sequence(total_row: int, increase: int, flip_after: int, directi
                 offsets.extend(block)
             needed -= full_block_len
         else:
-            if needed % 2 == 0:
+            if needed % 2 == 0 and not csv_not_sym:
                 half = needed // 2
                 if direction == "pos":
                     offsets.extend(block[:half])
@@ -111,17 +111,27 @@ def build_angle_sequence(total_row: int, increase: int, flip_after: int, directi
                     offsets.extend([-x for x in block[:half]])
                     offsets.extend(block[:half])
                 needed = 0
+            elif csv_not_sym:
+                if direction == "pos":
+                    offsets.extend(block)
+                else:
+                    offsets.extend([-x for x in block])
+                needed = 0
             else:
-                raise ValueError("total-row must be odd")
+                raise ValueError("check your parameters, especially --csv-not-sym")
         k += flip_after
 
     angles = [int(o * increase) for o in offsets]
     return angles
 
 
-def process_one_folder(folder: Path, frame_dir: Path, output_dir: Path, args):
+def process_one_folder(folder: Path, csv_folder: Path | None, frame_dir: Path, output_dir: Path, args):
     folder_name = folder.name
-    csv_path = folder / (folder_name + args.csv_suffix)
+    if csv_folder is None:
+        csv_path = folder / (folder_name + args.csv_suffix)
+    else:
+        csv_path = csv_folder / (folder_name + args.csv_suffix)
+
     if not csv_path.exists():
         print(f"[SKIP] {folder}: {csv_path.name} not found")
         return False
@@ -129,6 +139,9 @@ def process_one_folder(folder: Path, frame_dir: Path, output_dir: Path, args):
     order_rows = []
     with open(csv_path, "r", newline='') as fh:
         rdr = csv.reader(fh)
+        if args.omit_csv_header:
+            next(rdr)
+            
         for _, r in enumerate(rdr):
             order = int(r[0].strip())
             angle = float(r[1].strip())
@@ -140,7 +153,7 @@ def process_one_folder(folder: Path, frame_dir: Path, output_dir: Path, args):
 
     # The angles' sequence in the order list is not the real order because user might delete some
     # This would generate wrong dose. To handle this issue, expected angle_seq is created.
-    angle_seq = build_angle_sequence(args.total_row, args.increase, args.flip_after, args.direction)
+    angle_seq = build_angle_sequence(args.total_row, args.increase, args.flip_after, args.direction, args.csv_not_sym)
     dose_seq = [t * args.exposure for t in range(0, args.total_row)]
 
     star_rows = []
@@ -215,6 +228,9 @@ def main():
     ap.add_argument("--recursive", action="store_true", help="process folders recursively (default: False), i.e. the "
                                                              "input folder includes IMOD-processed folders")
     ap.add_argument("--workers", type=int, default=4, help="parallel workers (default 4)")
+    ap.add_argument("--csv-folder", default=None, help="csv folder (default None)")
+    ap.add_argument("--omit-csv-header", action="store_true", help="omit csv header (default False)")
+    ap.add_argument("--csv-not-sym", action="store_true", help="csv not symmetric (default False)")
     ap.add_argument("--csv-suffix", default="_test.csv", help="csv suffix (default _test.csv)")
     ap.add_argument("--total-row", type=int, default=35, help="expected total rows (default 35)")
     ap.add_argument("--exposure", type=float, default=3.0, help="exposure for each tilt (default 3)")
@@ -236,12 +252,16 @@ def main():
 
     root = Path(args.input)
     frame_dir = Path(args.frame_dir)
+    csv_folder = Path(args.csv_folder)
     if not root.exists() or not root.is_dir():
         print(f"Input {root} not found or not a directory", file=sys.stderr)
         sys.exit(2)
     if not frame_dir.exists() or not frame_dir.is_dir():
         print(f"Frame dir {frame_dir} not found or not a directory", file=sys.stderr)
         sys.exit(2)
+    if not csv_folder.exists() or not csv_folder.is_dir():
+        print(f"CSV folder {csv_folder} not found or not a directory (use input folder instead)")
+        csv_folder = None
     if args.total_row % 2 == 0:
         print(f"Wrong {args.total_row}: This script can only handle dose-symmetric data", file=sys.stderr)
         sys.exit(2)
@@ -261,7 +281,7 @@ def main():
     ok, fail = 0, 0
     print("------START------")
     with ProcessPoolExecutor(max_workers=args.workers) as exe:
-        futures = {exe.submit(process_one_folder, folder, frame_dir, output_dir, args): folder for folder in folders}
+        futures = {exe.submit(process_one_folder, folder, csv_folder, frame_dir, output_dir, args): folder for folder in folders}
         for fut in as_completed(futures):
             folder = futures[fut]
             try:

@@ -4,4 +4,5 @@ __pycache__/
 test/
 data/
 backup/
+lightning_logs/
 *.log

@@ -25,41 +25,47 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 import sys
+import csv
 import mrcfile
 
 
-def process_one_folder(folder: Path, output_folder: Path, mrc_suffix):
-    stack_name = folder.name + mrc_suffix
-    tlt_name = folder.name + ".tlt"
-    stack_path, tlt_path = folder / stack_name, folder / tlt_name
+def process_one_folder(folder: Path, csv_folder: Path | None, csv_suffix: str, output_folder: Path, mrc_suffix, omit_csv_header):
+    stack_path = folder / (folder.name + mrc_suffix)
     if stack_path is None:
         print(f"[SKIP] {folder}: No {stack_path} file.")
         return False
-
-    if tlt_path is None:
-        print(f"[SKIP] {folder}: No {tlt_path} file.")
+    
+    if csv_folder is None:
+        csv_path = folder / (folder.name + csv_suffix)
+    else:
+        csv_path = csv_folder / (folder.name + csv_suffix)
+    if csv_path is None:
+        print(f"[SKIP] {folder}: No {csv_path} file.")
         return False
 
     rows = []
-    with open(tlt_path, 'r') as tlt:
-        for r in tlt:
-            if not r:
-                continue
-            angle_str = r.strip()
-            angle = float(angle_str) if angle_str != '' else None
+    with open(csv_path, 'r', newline='') as fh:
+        rdr = csv.reader(fh)
+        if omit_csv_header:
+            next(rdr)
+            
+        for _, r in enumerate(rdr):
+            angle = float(r[1].strip())
             rows.append(angle)
 
     if not rows:
-        print(f"[SKIP] {folder}: No rows in {tlt_path} file.")
+        print(f"[SKIP] {folder}: No rows in {csv_path} file.")
         return False
 
+    rows.sort()
+    # print(f"[INFO] {folder}: sorted rows: {rows}")
     with mrcfile.open(stack_path, permissive=True) as ts:  # permissive to tolerate some stack missing part of data
         if ts.data is None:
             print(f"[SKIP] {folder}: {stack_path} has no valid data block.")
             return False
 
         if len(rows) != len(ts.data):
-            print(f"[SKIP] {folder}: Not matching sections between {stack_path} and {tlt_path}.")
+            print(f"[SKIP] {folder}: Not matching sections between {stack_path} and {csv_path}.")
             return False
 
         try:
@@ -75,12 +81,14 @@ def process_one_folder(folder: Path, output_folder: Path, mrc_suffix):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Split IMOD-processed tilt series stacks into individual MRC images "
-                                             "using .tlt angle files.")
+    ap = argparse.ArgumentParser(description="Split IMOD-processed tilt series stacks into individual MRC images using order CSV files.")
     ap.add_argument("-i", "--input", required=True, help="input folder containing multi IMOD-processed folders")
     ap.add_argument("--recursive", action="store_true", help="process folders recursively (default: False), i.e. the "
                                                              "input folder includes IMOD-processed folders")
     ap.add_argument("-o", "--output", required=True, help="output folder for .mrc images")
+    ap.add_argument("--csv-folder", default=None, help="csv folder (default None)")
+    ap.add_argument("--omit-csv-header", action="store_true", help="omit csv header (default False)")
+    ap.add_argument("--csv-suffix", default="_test.csv", help="csv suffix (default _test.csv)")
     ap.add_argument("--mrc-suffix", default=".mrc", help="mrc suffix (default .mrc)")
     ap.add_argument("--log", help="log file containing processed folders (default: <output>/processed_ts.log)")
     ap.add_argument("--workers", type=int, default=4, help="parallel workers (default: 4)")
@@ -88,11 +96,15 @@ def main():
     args = ap.parse_args()
 
     input_folder = Path(args.input)
+    csv_folder = Path(args.csv_folder)
     output_folder = Path(args.output)
     log_file = Path(args.log) if args.log else output_folder / "processed_ts.log"
     if not input_folder.exists() or not input_folder.is_dir():
         print(f"Input {input_folder} not found or not a directory", file=sys.stderr)
         sys.exit(2)
+    if not csv_folder.exists() or not csv_folder.is_dir():
+        print(f"CSV folder {csv_folder} not found or not a directory (use input folder instead)")
+        csv_folder = None
 
     output_folder.mkdir(parents=True, exist_ok=True)
     processed = set()
@@ -117,7 +129,7 @@ def main():
     ok, fail = 0, 0
     print("------START------")
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_one_folder, folder, output_folder, args.mrc_suffix): folder for folder in folders}
+        futures = {executor.submit(process_one_folder, folder, csv_folder, args.csv_suffix, output_folder, args.mrc_suffix, args.omit_csv_header): folder for folder in folders}
         for fut in as_completed(futures):
             folder = futures[fut]
             try:
@@ -127,7 +139,7 @@ def main():
                 fail += 1
             else:
                 if res:
-                    print(f"[OK] {folder}")
+                    # print(f"[OK] {folder}")
                     ok += 1
                     with open(log_file, "a") as logf:
                         logf.write(str(folder) + "\n")
